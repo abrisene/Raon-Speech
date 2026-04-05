@@ -54,6 +54,7 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=512, help="Max generation tokens")
     parser.add_argument("--temperature", type=float, default=1.2, help="Audio sampling temperature")
     parser.add_argument("--top-k", type=int, default=20, help="Top-k sampling")
+    parser.add_argument("--speaker", type=str, default=None, help="Speaker reference audio for voice conditioning")
     args = parser.parse_args()
 
     # Suppress noisy tokenizer warnings at all levels
@@ -69,7 +70,8 @@ def main():
 
     processor = RaonProcessor.from_pretrained(tokenizer_path)
     prompt = get_default_tts_prompt()
-    messages = [{"role": "user", "content": f"{prompt}:\n{args.text}"}]
+    speaker_prefix = "<|speaker_embedding_placeholder|>" if args.speaker else ""
+    messages = [{"role": "user", "content": f"{speaker_prefix}{prompt}:\n{args.text}"}]
     inputs = processor(messages, add_generation_prompt=True, force_audio_output=True, device="cpu")
     input_ids = mx.array(inputs["input_ids"].numpy())
     logging.disable(logging.NOTSET)
@@ -105,6 +107,17 @@ def main():
     t1 = time.time()
     print(f"Model ready in {t1 - t0:.1f}s")
 
+    # Speaker conditioning
+    speaker_embedding = None
+    if args.speaker:
+        from .utils.speaker import extract_speaker_embedding
+        print(f"Extracting speaker embedding from {args.speaker}...")
+        speaker_embedding = extract_speaker_embedding(
+            args.speaker,
+            projection_weight=model.speaker_projection.weight,
+        )
+        print("Speaker embedding ready")
+
     # Generate
     print(f'\nGenerating: "{args.text}"')
     t0 = time.time()
@@ -113,6 +126,7 @@ def main():
         max_new_tokens=args.max_tokens,
         audio_temperature=args.temperature,
         top_k=args.top_k,
+        speaker_embedding=speaker_embedding,
     )
     # Force materialization
     if pcm.shape[1] > 0:

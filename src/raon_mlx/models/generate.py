@@ -188,6 +188,8 @@ def tts_generate(
     audio_temperature: float = 1.2,
     top_k: int = 20,
     top_p: float = 0.8,
+    speaker_embedding: mx.array | None = None,
+    on_audio_frame: callable | None = None,
 ) -> tuple[mx.array, int]:
     """Generate speech audio from text token IDs.
 
@@ -199,6 +201,10 @@ def tts_generate(
         audio_temperature: Audio code sampling temperature.
         top_k: Top-k for sampling.
         top_p: Top-p for text sampling.
+        speaker_embedding: Optional speaker conditioning. Shape: [1, 1, 4096].
+            If provided, replaces the SPEAKER_EMBEDDING_PLACEHOLDER token embedding.
+        on_audio_frame: Optional callback for streaming. Called with (pcm_chunk, sample_rate)
+            after each decoded audio frame.
 
     Returns:
         Tuple of (audio_waveform, sample_rate).
@@ -214,8 +220,22 @@ def tts_generate(
     thinker_cache = model.thinker.make_cache()
     talker_cache = model.talker.make_cache()
 
-    # Prefill: run input_ids through thinker
-    thinker_normed, thinker_pre_norm = model.thinker(input_ids=input_ids, cache=thinker_cache)
+    # Build input embeddings, optionally replacing speaker placeholder
+    inputs_embeds = model.thinker.embed_tokens(input_ids)  # [1, seq_len, 4096]
+
+    if speaker_embedding is not None:
+        # Find SPEAKER_EMBEDDING_PLACEHOLDER positions and replace
+        speaker_token_id = 151671  # SPEAKER_EMBEDDING_PLACEHOLDER
+        speaker_mask = (input_ids == speaker_token_id)  # [1, seq_len]
+        if speaker_mask.any():
+            # Replace the placeholder embedding with the speaker embedding
+            spk = speaker_embedding[:, 0, :]  # [1, 4096]
+            for pos in range(input_ids.shape[1]):
+                if input_ids[0, pos].item() == speaker_token_id:
+                    inputs_embeds = inputs_embeds.at[:, pos, :].add(spk - inputs_embeds[:, pos, :])
+
+    # Prefill: run through thinker
+    thinker_normed, thinker_pre_norm = model.thinker(inputs_embeds=inputs_embeds, cache=thinker_cache)
 
     # Project PRE-NORM output to talker space (critical: talker sees unnormed hidden states)
     talker_input = model.thinker_to_talker_proj(thinker_pre_norm)
@@ -251,6 +271,13 @@ def tts_generate(
         if audio_end:
             break
         audio_codes_list.append(codes)
+
+        # Streaming: decode and emit each frame as it's generated
+        if on_audio_frame is not None:
+            frame_codes = codes[:, :, None]  # [1, 16, 1]
+            frame_pcm = model.mimi.decode_step(frame_codes)  # [1, 1, samples_per_frame]
+            mx.synchronize()
+            on_audio_frame(frame_pcm[:, 0], 24000)
 
     if not audio_codes_list:
         return mx.zeros((1, 0)), 24000
