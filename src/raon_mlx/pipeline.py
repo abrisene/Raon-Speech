@@ -19,7 +19,7 @@ import numpy as np
 import soundfile as sf
 
 from .models.raon import RaonMLX
-from .models.generate import tts_generate, stt_generate
+from .models.generate import tts_generate, stt_generate, voice_chat_generate
 
 logger = logging.getLogger(__name__)
 
@@ -229,6 +229,34 @@ class RaonMLXPipeline:
             max_new_tokens=1024, temperature=0.7,
         )
         return self.processor.tokenizer.decode(token_ids, skip_special_tokens=True)
+
+    def voice_chat(
+        self,
+        audio: str,
+        speaker_audio: str | None = None,
+        seed: int | None = None,
+    ) -> tuple[str, np.ndarray | None, int]:
+        """Voice chat: audio in → text + audio out.
+
+        Chains STT → text response → TTS: the model listens, thinks, then speaks.
+
+        Args:
+            audio: Path to input audio file.
+            speaker_audio: Optional speaker reference for voice conditioning.
+            seed: Optional random seed for reproducible voice.
+
+        Returns:
+            Tuple of (text_response, audio_waveform_or_None, sample_rate).
+        """
+        # Step 1: Understand the audio (SpeechChat → text response)
+        text_response = self.speech_chat(audio)
+
+        if not text_response.strip():
+            return "", None, self.sampling_rate
+
+        # Step 2: Speak the response (TTS)
+        audio_out, sr = self.tts(text_response, speaker_audio=speaker_audio, seed=seed)
+        return text_response, audio_out, sr
 
     @staticmethod
     def save_audio(audio_data: tuple, path: str) -> None:

@@ -253,6 +253,41 @@ src/raon_mlx/
 └── pipeline.py          # High-level API matching RaonPipeline
 ```
 
+## Voice Shaping (Future Work)
+
+Beyond speaker reference audio and voice seed, there are several approaches to control voice characteristics:
+
+1. **Voice presets** — pre-compute speaker embeddings from diverse reference samples, save as named presets (e.g. "deep male", "bright female", "narrator"). Users pick from a dropdown.
+2. **Embedding interpolation** — blend two preset embeddings: `0.7 * voice_A + 0.3 * voice_B` to create novel voices between two references.
+3. **Embedding arithmetic** — vector operations on speaker embeddings: `narrator - male + female = female narrator` (analogous to word2vec arithmetic).
+4. **Direct embedding editing** — map perceptual qualities (pitch, breathiness, pace, warmth) to embedding dimensions via PCA or supervised probing, then expose as sliders.
+5. **Voice seed** — currently implemented. Same seed = reproducible voice. Different seeds sample different points in the model's voice prior space.
+
+## Real-Time Conversation (Next)
+
+### Architecture
+
+For real-time voice conversation, the pipeline is:
+
+1. **User speaks** → audio chunks → audio encoder (AuT) → embeddings
+2. **Model thinks** → thinker processes audio embeddings → generates response
+3. **Model speaks** → talker + code predictor → audio codes → Mimi decode → PCM
+4. **Streaming** → output audio as it's generated, overlap with continued listening
+
+### Turn-Based Conversation (stepping stone)
+
+Before full duplex, implement turn-based: user speaks → model responds with audio.
+This uses the existing STT + TTS pipeline chained together, with the SpeechChat task
+providing the model's response generation.
+
+### Full Duplex (Raon-SpeechChat-9B)
+
+The SpeechChat model adds simultaneous listen/speak capability:
+- Dual-stream audio processing (user + assistant channels)
+- Explicit interaction state modeling (speaking, listening, backchanneling)
+- Turn-taking and interruption handling
+- Requires the duplex model architecture (separate from base Speech model)
+
 ## Open Questions
 
 1. **Mimi num_quantizers**: Raon uses 32 quantizers (1 semantic + 31 acoustic) but Moshi typically uses 8 or 16. PersonaPlex's VQ is parameterized, so this should work, but needs verification.
