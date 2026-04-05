@@ -185,7 +185,14 @@ class Qwen3Model(nn.Module):
         inputs_embeds: mx.array | None = None,
         cache: list[KVCache] | None = None,
         mask: mx.array | None = None,
-    ) -> mx.array:
+    ) -> tuple[mx.array, mx.array]:
+        """Forward pass through the Qwen3 model.
+
+        Returns:
+            Tuple of (normed_output, pre_norm_output).
+            normed_output: After final RMSNorm — used for lm_head/text logits.
+            pre_norm_output: Last layer output before norm — used for talker projection.
+        """
         if inputs_embeds is None:
             assert input_ids is not None
             xs = self.embed_tokens(input_ids)
@@ -202,7 +209,8 @@ class Qwen3Model(nn.Module):
             layer_cache = cache[i] if cache is not None else None
             xs = layer(xs, cache=layer_cache, mask=mask)
 
-        return self.norm(xs)
+        pre_norm = xs
+        return self.norm(xs), pre_norm
 
     def make_cache(self) -> list[KVCache]:
         return [

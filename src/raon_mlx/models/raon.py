@@ -63,6 +63,25 @@ def code_predictor_config() -> Qwen3Config:
 
 # ---- Sub-models ----
 
+class OutputAdaptor(nn.Module):
+    """2-layer MLP that projects Mimi VQ latents (512) to thinker embedding space (4096).
+
+    During autoregressive audio generation, the thinker receives this instead of
+    the raw AUDIO_OUTPUT_PLACEHOLDER token embedding.
+    """
+
+    def __init__(self, input_size: int = 512, output_size: int = 4096, norm_eps: float = 1e-6):
+        super().__init__()
+        self.proj_0 = nn.Linear(input_size, output_size, bias=False)
+        self.proj_2 = nn.Linear(output_size, output_size, bias=False)
+        self.post_norm = Qwen3RMSNorm(output_size, eps=norm_eps)
+
+    def __call__(self, xs: mx.array) -> mx.array:
+        xs = nn.gelu(self.proj_0(xs))
+        xs = self.proj_2(xs)
+        return self.post_norm(xs)
+
+
 class ThinkerToTalkerProjection(nn.Module):
     """MLP projection from thinker hidden_size (4096) to talker hidden_size (2048)."""
 
@@ -218,6 +237,7 @@ class RaonMLX(nn.Module):
         self.proj_code = nn.Linear(talker_cfg.hidden_size, cp_cfg.hidden_size, bias=True)
         self.audio_lm_head = nn.Linear(talker_cfg.hidden_size, 2049, bias=False)
         self.lm_head = nn.Linear(thinker_cfg.hidden_size, thinker_cfg.vocab_size, bias=False)
+        self.output_adaptor = OutputAdaptor(input_size=512, output_size=thinker_cfg.hidden_size)
         self.mimi = Mimi(mimi_cfg)
 
         # Configs for reference
@@ -287,6 +307,17 @@ class RaonMLX(nn.Module):
 
         # Load Mimi codec
         self.mimi.load_raon_weights(components["audio_tokenizer"], strict=False)
+
+        # Load output adaptor
+        oa = {k.removeprefix("output_adaptor."): v
+              for k, v in components["top_level"].items() if k.startswith("output_adaptor.")}
+        if oa:
+            # Map HF keys: proj.0.weight -> proj_0.weight, proj.2.weight -> proj_2.weight
+            oa_mapped = []
+            for k, v in oa.items():
+                k = k.replace("proj.0.", "proj_0.").replace("proj.2.", "proj_2.")
+                oa_mapped.append((k, v))
+            self.output_adaptor.load_weights(oa_mapped, strict=False)
 
         # Load top-level weights
         top = components["top_level"]
