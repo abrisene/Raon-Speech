@@ -187,24 +187,29 @@ ECAPA-TDNN from SpeechBrain. Small model (~10M params), runs once per utterance.
 
 The Raon-SpeechChat-9B model (`RaonDuplexModel`) adds real-time duplex capabilities. This is a separate model with additional architecture on top. Tackle after the base model works.
 
-## Expected Performance
+## Measured Performance (M5 Max, 128GB)
 
-### 4-bit Quantized on M5 Max (128GB)
+### Backbone-only (Qwen3 thinker, 36 layers)
 
-- **Model size**: ~4.5GB (backbone) + ~1GB (other components) ≈ 5.5GB
-- **Memory bandwidth**: ~546 GB/s (M5 Max)
-- **Theoretical throughput**: 546 / 5.5 ≈ ~100 tokens/sec for backbone
-- **Realistic (with overhead)**: ~40-60 tokens/sec
-- **At 12.5 audio frames/sec**: likely **faster than real-time TTS**
-- **Target RTF**: < 1.0 (real-time capable)
+| Precision | tok/s | Backbone RTF |
+|-----------|-------|-------------|
+| bfloat16 (no quant) | 7.0 | 1.80 |
+| **4-bit quantized** | **69.4** | **0.18** |
 
-### Comparison
+### Full TTS Pipeline (end-to-end)
 
-| Setup | RTF | Real-time? |
-|-------|-----|-----------|
-| RTX 6000 Pro (KRAFTON benchmark) | 0.27 | Yes (3.7x) |
-| MPS float16 (current, M5 Max) | 2.52 | No (0.4x) |
-| MLX 4-bit quantized (projected) | 0.3-0.8 | Likely yes |
+| Config | RTF | Speed | Notes |
+|--------|-----|-------|-------|
+| PyTorch MPS float16 | 2.52 | 0.4x | Baseline |
+| MLX thinker=4bit only | 1.08 | 0.9x | Code predictor bottleneck |
+| MLX all=4bit | 0.49 | 2.0x | |
+| **MLX thinker=4bit, talker+cp=8bit** | **0.46** | **2.2x** | **Best quality/speed tradeoff** |
+| RTX 6000 Pro (KRAFTON benchmark) | 0.27 | 3.7x | Datacenter GPU reference |
+
+### Comparison with original projections
+
+- Projected: RTF 0.3-0.8 → **Achieved: RTF 0.46** (within range, toward the fast end)
+- The hybrid quantization (4-bit backbone, 8-bit audio components) is both faster and higher quality than uniform 4-bit
 
 ## File Structure
 
