@@ -87,7 +87,8 @@ class ResidualVectorQuantization(nn.Module):
         return mx.stack(codes, axis=0)
 
     def decode(self, xs: mx.array) -> mx.array:
-        seq_len = xs.shape[0]
+        # xs shape: [num_codebooks, ...] — may be fewer than len(self.layers)
+        seq_len = min(xs.shape[0], len(self.layers))
         quantized = self.layers[0].decode(xs[0])
         for i in range(1, seq_len):
             quantized = quantized + self.layers[i].decode(xs[i])
