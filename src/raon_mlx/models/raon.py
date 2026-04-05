@@ -237,6 +237,7 @@ class RaonMLX(nn.Module):
         self.proj_code = nn.Linear(talker_cfg.hidden_size, cp_cfg.hidden_size, bias=True)
         self.audio_lm_head = nn.Linear(talker_cfg.hidden_size, 2049, bias=False)
         self.lm_head = nn.Linear(thinker_cfg.hidden_size, thinker_cfg.vocab_size, bias=False)
+        self.input_adaptor = OutputAdaptor(input_size=2048, output_size=thinker_cfg.hidden_size)  # Same arch as output adaptor
         self.output_adaptor = OutputAdaptor(input_size=512, output_size=thinker_cfg.hidden_size)
         self.speaker_projection = nn.Linear(192, thinker_cfg.hidden_size, bias=False)
         self.mimi = Mimi(mimi_cfg)
@@ -351,6 +352,16 @@ class RaonMLX(nn.Module):
 
         # Load Mimi codec
         self.mimi.load_raon_weights(components["audio_tokenizer"], strict=False)
+
+        # Load input adaptor
+        ia = {k.removeprefix("input_adaptor."): v
+              for k, v in components["top_level"].items() if k.startswith("input_adaptor.")}
+        if ia:
+            ia_mapped = []
+            for k, v in ia.items():
+                k = k.replace("proj.0.", "proj_0.").replace("proj.2.", "proj_2.")
+                ia_mapped.append((k, v))
+            self.input_adaptor.load_weights(ia_mapped, strict=False)
 
         # Load output adaptor
         oa = {k.removeprefix("output_adaptor."): v
