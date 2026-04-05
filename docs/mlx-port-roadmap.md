@@ -4,11 +4,27 @@
 
 Port Raon-Speech inference to Apple MLX for quantized, high-performance inference on Apple Silicon. Target: 4-bit quantized model running at or near real-time TTS on M-series chips.
 
-## Current State
+## Current State (Updated 2026-04-04)
 
-- MPS (PyTorch Metal backend) works at RTF 2.52 (0.4x real-time) on M5 Max with float16
-- Models downloaded: Raon-Speech-9B, Raon-SpeechChat-9B
+**MLX port is functional.** End-to-end TTS working at 2.3x real-time on M5 Max.
+
+- Branch: `feat/mlx-port` (12 commits)
 - Fork: `git@github.com:abrisene/Raon-Speech.git`
+- Pre-converted model: `models/Raon-Speech-9B-mlx-hybrid` (6.46 GB, hybrid quant)
+
+### What's Working
+- TTS generation (text → speech)
+- Speaker conditioning (voice cloning from reference audio)
+- Model conversion (HF → quantized MLX safetensors)
+- Streaming callback support (per-frame PCM output)
+- CLI: `python -m raon_mlx.tts`
+
+### What's Not Yet Implemented
+- STT (needs audio encoder — Phase 5)
+- SpeechChat / TextQA (needs audio encoder)
+- Full-duplex / Raon-SpeechChat-9B model
+- Repetition-aware sampling (RAS)
+- TTS continuation from reference audio
 
 ## Prior Art: PersonaPlex MLX Port
 
@@ -94,7 +110,7 @@ We have a complete MLX port of Moshi (Kyutai) at `/Users/dr/Models/Clients/perso
 
 ## Port Plan
 
-### Phase 1: Mimi Codec (1-2 days)
+### Phase 1: Mimi Codec ✅
 
 **Goal**: Raon's Mimi weights loading into PersonaPlex's MLX Mimi.
 
@@ -109,7 +125,7 @@ The architectures are identical. The difference is weight key naming:
 
 **Risk**: Raon may have modified the Mimi config slightly (e.g., `num_quantizers: 32` vs Moshi's typical 8-16). The architecture is the same but the VQ may have more codebooks. PersonaPlex's `SplitResidualVectorQuantizer` is parameterized by `nq` so this should just work.
 
-### Phase 2: Qwen3 Backbone in MLX (2-3 days)
+### Phase 2: Qwen3 Backbone in MLX ✅
 
 **Goal**: The 36-layer Qwen3 thinker running in MLX with KV cache.
 
@@ -131,7 +147,7 @@ The architectures are identical. The difference is weight key naming:
 
 **Quantization**: This is the biggest module. Apply 4-bit quantization here using `mlx.nn.quantize()`. The 8B backbone drops from ~16GB to ~4.5GB at 4-bit.
 
-### Phase 3: Talker + Code Predictor (1-2 days)
+### Phase 3: Talker + Code Predictor ✅
 
 **Goal**: The audio code generation pipeline in MLX.
 
@@ -144,7 +160,7 @@ The talker is just 4 more Qwen3 layers (smaller hidden size 2048). The code pred
 4. Write weight mapping for `talker.*`, `proj_code.*`, `code_predictor.*` keys
 5. Implement the `audio_lm_head` (linear projection to codebook logits)
 
-### Phase 4: Generation Loop (1-2 days)
+### Phase 4: Generation Loop ✅
 
 **Goal**: End-to-end TTS and STT inference in MLX.
 
@@ -160,7 +176,7 @@ The generation loop is in `src/raon/models/wrapper.py`:
 4. Wire up Mimi decode at the end
 5. Benchmark: measure tokens/sec and RTF
 
-### Phase 5: Audio Encoder (1-2 days, can defer)
+### Phase 5: Audio Encoder (not started)
 
 **Goal**: STT and SpeechChat support.
 
@@ -173,7 +189,7 @@ The audio encoder is a Whisper-like architecture (AuT wrapper). This is NOT need
 
 **Can defer**: TTS is the primary use case. Audio input tasks can stay on PyTorch/MPS initially.
 
-### Phase 6: Speaker Encoder (optional, can defer)
+### Phase 6: Speaker Encoder ✅ (hybrid approach)
 
 **Goal**: Voice-conditioned TTS.
 
@@ -183,7 +199,7 @@ ECAPA-TDNN from SpeechBrain. Small model (~10M params), runs once per utterance.
 - Keep in PyTorch/MPS (single boundary crossing per utterance — negligible overhead)
 - Port to MLX later if desired
 
-### Phase 7: SpeechChat / Full-Duplex (stretch goal)
+### Phase 7: SpeechChat / Full-Duplex (not started)
 
 The Raon-SpeechChat-9B model (`RaonDuplexModel`) adds real-time duplex capabilities. This is a separate model with additional architecture on top. Tackle after the base model works.
 
