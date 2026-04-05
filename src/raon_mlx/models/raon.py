@@ -238,6 +238,7 @@ class RaonMLX(nn.Module):
         self.audio_lm_head = nn.Linear(talker_cfg.hidden_size, 2049, bias=False)
         self.lm_head = nn.Linear(thinker_cfg.hidden_size, thinker_cfg.vocab_size, bias=False)
         self.output_adaptor = OutputAdaptor(input_size=512, output_size=thinker_cfg.hidden_size)
+        self.speaker_projection = nn.Linear(192, thinker_cfg.hidden_size, bias=False)
         self.mimi = Mimi(mimi_cfg)
 
         # Configs for reference
@@ -372,4 +373,8 @@ class RaonMLX(nn.Module):
             self.proj_code.load_weights([
                 ("weight", top["proj_code.weight"]),
                 ("bias", top["proj_code.bias"]),
+            ], strict=False)
+        if "speaker_encoder.projection.weight" in top:
+            self.speaker_projection.load_weights([
+                ("weight", top["speaker_encoder.projection.weight"]),
             ], strict=False)
