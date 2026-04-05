@@ -47,6 +47,7 @@ def run_inference(
     text: str,
     audio: tuple[int, np.ndarray] | None,
     ref_audio: tuple[int, np.ndarray] | None,
+    voice_seed: int = -1,
 ):
     try:
         if task == "STT":
@@ -60,7 +61,8 @@ def run_inference(
             if not text.strip():
                 return "TTS requires text input.", None
             speaker_path = audio_to_tempfile(ref_audio)
-            audio_out, sr = pipe.tts(text, speaker_audio=speaker_path)
+            seed = int(voice_seed) if voice_seed >= 0 else None
+            audio_out, sr = pipe.tts(text, speaker_audio=speaker_path, seed=seed)
             return "", (sr, audio_out)
 
         elif task == "SpeechChat":
@@ -106,6 +108,7 @@ def build_interface(pipe: RaonMLXPipeline) -> gr.Blocks:
                 text_in = gr.Textbox(label="Text Input", lines=3, placeholder="Enter text for TTS or TextQA...")
                 audio_in = gr.Audio(label="Audio Input", type="numpy", visible=False)
                 ref_audio = gr.Audio(label="Speaker Reference (optional)", type="numpy", visible=True)
+                voice_seed = gr.Number(label="Voice Seed (-1 = random)", value=-1, precision=0, visible=True)
                 generate_btn = gr.Button("Generate", variant="primary")
 
             with gr.Column():
@@ -116,24 +119,26 @@ def build_interface(pipe: RaonMLXPipeline) -> gr.Blocks:
             show_text_in = t in ("TTS", "TextQA")
             show_audio_in = t in ("STT", "TextQA", "SpeechChat")
             show_ref = t == "TTS"
+            show_seed = t == "TTS"
             show_text_out = t != "TTS"
             show_audio_out = t == "TTS"
             return (
                 gr.update(visible=show_text_in),
                 gr.update(visible=show_audio_in),
                 gr.update(visible=show_ref),
+                gr.update(visible=show_seed),
                 gr.update(visible=show_text_out),
                 gr.update(visible=show_audio_out),
             )
 
         task.change(
             on_task_change, [task],
-            [text_in, audio_in, ref_audio, text_out, audio_out],
+            [text_in, audio_in, ref_audio, voice_seed, text_out, audio_out],
         )
 
         generate_btn.click(
-            lambda t, txt, aud, ref: run_inference(pipe, t, txt, aud, ref),
-            inputs=[task, text_in, audio_in, ref_audio],
+            lambda t, txt, aud, ref, seed: run_inference(pipe, t, txt, aud, ref, seed),
+            inputs=[task, text_in, audio_in, ref_audio, voice_seed],
             outputs=[text_out, audio_out],
         )
 

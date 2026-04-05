@@ -149,7 +149,7 @@ class RaonMLXPipeline:
         )
         return self.processor.tokenizer.decode(token_ids, skip_special_tokens=True)
 
-    def tts(self, text: str, speaker_audio: str | None = None) -> tuple:
+    def tts(self, text: str, speaker_audio: str | None = None, seed: int | None = None) -> tuple:
         """TTS: text -> (waveform_tensor, sampling_rate)."""
         from raon.utils.processor import get_default_tts_prompt
         from raon.utils.special_tokens import SPEAKER_EMBEDDING_PLACEHOLDER
@@ -161,6 +161,9 @@ class RaonMLXPipeline:
         inputs = self._tokenize(messages, force_audio_output=True)
         input_ids = mx.array(inputs["input_ids"].numpy())
         speaker_embedding = self._get_speaker_embedding(speaker_audio)
+
+        if seed is not None:
+            mx.random.seed(seed)
 
         pcm, sr = tts_generate(
             self.model, input_ids,
