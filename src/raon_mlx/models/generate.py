@@ -168,14 +168,12 @@ def _get_audio_output_embed(model: RaonMLX, codes: mx.array) -> mx.array:
     Returns:
         Thinker-space embedding. Shape: [B, 1, 4096].
     """
-    # Pad to 32 codebooks for Mimi quantizer
+    # VQ decode with only 16 codebooks (don't pad to 32)
     B = codes.shape[0]
-    padding = mx.zeros((B, 16), dtype=codes.dtype)
-    codes_32 = mx.concatenate([codes, padding], axis=1)  # [B, 32]
-    codes_32 = codes_32[:, :, None]  # [B, 32, 1] — single frame
+    codes_16 = codes[:, :, None]  # [B, 16, 1] — single frame
 
     # VQ decode: codes -> latent features [B, 512, 1]
-    latent = model.mimi.quantizer.decode(codes_32)  # [B, 512, 1]
+    latent = model.mimi.quantizer.decode(codes_16)  # [B, 512, 1]
     latent = latent.transpose(0, 2, 1)  # [B, 1, 512]
 
     # Project to thinker embedding space
@@ -261,12 +259,10 @@ def tts_generate(
     all_codes = mx.stack(audio_codes_list, axis=1)  # [1, num_frames, 16]
     all_codes = all_codes.transpose(0, 2, 1)  # [1, 16, num_frames]
 
-    # Pad to 32 codebooks (Mimi uses 32, we only predict 16)
-    padding = mx.zeros((1, 16, all_codes.shape[2]), dtype=all_codes.dtype)
-    all_codes_32 = mx.concatenate([all_codes, padding], axis=1)  # [1, 32, num_frames]
-
-    # Decode through Mimi
-    pcm = model.mimi.decode(all_codes_32)  # [1, 1, num_samples]
+    # Decode through Mimi with only the 16 generated codebooks (NOT padded to 32)
+    # The RVQ decode sums contributions from each codebook — padding with zeros
+    # would subtract from the reconstruction since the zero code != silence.
+    pcm = model.mimi.decode(all_codes)  # [1, 1, num_samples]
     pcm = pcm[:, 0]  # [1, num_samples]
 
     return pcm, 24000
