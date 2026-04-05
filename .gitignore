@@ -202,8 +202,8 @@ cython_debug/
 # .vscode/
 
 # Model weights and generated output
-models/
-output/
+/models/
+/output/
 
 # OMC state
 .omc/
