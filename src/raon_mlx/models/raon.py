@@ -11,6 +11,7 @@ import mlx.nn as nn
 
 from .mimi import Mimi, MimiConfig, mimi_raon
 from .qwen3 import Qwen3Config, Qwen3Model, Qwen3RMSNorm, Qwen3DecoderLayer
+from .qwen3_5 import Qwen3_5Config, Qwen3_5Model
 from ..modules.kv_cache import KVCache, create_additive_causal_mask
 
 
@@ -215,18 +216,30 @@ class RaonMLX(nn.Module):
 
     def __init__(
         self,
-        thinker_cfg: Qwen3Config | None = None,
+        thinker_cfg: Qwen3Config | Qwen3_5Config | None = None,
         talker_cfg: Qwen3Config | None = None,
         cp_cfg: Qwen3Config | None = None,
         mimi_cfg: MimiConfig | None = None,
+        backbone: str = "qwen3",
     ):
         super().__init__()
-        thinker_cfg = thinker_cfg or thinker_config()
+        thinker_cfg = thinker_cfg or (thinker_config() if backbone == "qwen3" else None)
         talker_cfg = talker_cfg or talker_config()
         cp_cfg = cp_cfg or code_predictor_config()
         mimi_cfg = mimi_cfg or mimi_raon()
 
-        self.thinker = Qwen3Model(thinker_cfg)
+        self.backbone_type = backbone
+        if backbone == "qwen3":
+            if thinker_cfg is None:
+                thinker_cfg = thinker_config()
+            self.thinker = Qwen3Model(thinker_cfg)
+        elif backbone == "qwen3.5":
+            if thinker_cfg is None:
+                thinker_cfg = Qwen3_5Config()
+            assert isinstance(thinker_cfg, Qwen3_5Config)
+            self.thinker = Qwen3_5Model(thinker_cfg)
+        else:
+            raise ValueError(f"Unknown backbone: {backbone}. Use 'qwen3' or 'qwen3.5'")
         self.talker = Talker(talker_cfg)
         self.thinker_to_talker_proj = ThinkerToTalkerProjection(
             thinker_dim=thinker_cfg.hidden_size,
