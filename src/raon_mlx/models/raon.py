@@ -245,6 +245,49 @@ class RaonMLX(nn.Module):
         self.talker_cfg = talker_cfg
         self.cp_cfg = cp_cfg
 
+    def load_mlx_weights(self, mlx_model_path: str):
+        """Load pre-converted MLX weights (from convert.py).
+
+        Reads config.json to determine quantization, applies matching quantization
+        to the model structure (so weight shapes match), then loads the saved weights.
+
+        Args:
+            mlx_model_path: Path to directory containing model.safetensors + config.json from convert.
+        """
+        import json
+        from pathlib import Path
+        from ..modules.quantization import EuclideanCodebook
+        from ..modules.conv import ConvTranspose1d
+
+        config_path = Path(mlx_model_path) / "config.json"
+        with open(config_path) as f:
+            cfg = json.load(f)
+
+        # Apply quantization to match saved weight shapes
+        thinker_bits = cfg.get("thinker_bits", 16)
+        talker_bits = cfg.get("talker_bits", 16)
+        cp_bits = cfg.get("cp_bits", 16)
+
+        if thinker_bits in (4, 8):
+            nn.quantize(self.thinker, bits=thinker_bits, group_size=64)
+        if talker_bits in (4, 8):
+            nn.quantize(self.talker, bits=talker_bits, group_size=64)
+        if cp_bits in (4, 8):
+            nn.quantize(self.code_predictor.model, bits=cp_bits, group_size=64)
+
+        weights_path = Path(mlx_model_path) / "model.safetensors"
+        weights = mx.load(str(weights_path))
+        self.load_weights(list(weights.items()), strict=False)
+
+        # Post-load fixups for codebook and conv transpose
+        def _post_load(module, name, _):
+            if isinstance(module, EuclideanCodebook) and name == "initialized":
+                module.update_in_place()
+            if isinstance(module, ConvTranspose1d) and name == "weight":
+                module.update_in_place()
+            return True
+        self.filter_and_map(_post_load)
+
     def load_weights_from_raon(self, model_path: str):
         """Load all weights from a Raon-Speech HF checkpoint directory.
 
