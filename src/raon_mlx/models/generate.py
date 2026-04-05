@@ -59,6 +59,7 @@ def generate_audio_codes(
     talker_hidden: mx.array,
     temperature: float = 1.2,
     top_k: int = 20,
+    suppress_eos: bool = False,
 ) -> mx.array:
     """Generate 16 audio codebook codes from the talker's last hidden state.
 
@@ -86,6 +87,9 @@ def generate_audio_codes(
 
     # First codebook: from audio_lm_head
     first_logits = model.audio_lm_head(talker_hidden[:, -1])  # [B, 2049]
+    if suppress_eos and first_logits.shape[-1] > codebook_size:
+        # Suppress AUDIO_END token (index 2048)
+        first_logits = first_logits.at[..., codebook_size].add(-1e9)
     if temperature > 0:
         first_code = sample_token(first_logits, temperature=temperature, top_k=top_k, top_p=1.0)
     else:
@@ -149,6 +153,35 @@ def generate_audio_codes(
     return all_codes
 
 
+def _get_audio_output_embed(model: RaonMLX, codes: mx.array) -> mx.array:
+    """Convert generated audio codes to thinker input embeddings.
+
+    This is the critical feedback loop: the thinker needs to know what audio was
+    generated so it can condition the next frame. The codes are decoded through
+    Mimi's VQ (not full waveform decode) to get latent features, then projected
+    to thinker embedding space via the output_adaptor.
+
+    Args:
+        model: The full RaonMLX model.
+        codes: Audio codes for one frame. Shape: [B, 16].
+
+    Returns:
+        Thinker-space embedding. Shape: [B, 1, 4096].
+    """
+    # Pad to 32 codebooks for Mimi quantizer
+    B = codes.shape[0]
+    padding = mx.zeros((B, 16), dtype=codes.dtype)
+    codes_32 = mx.concatenate([codes, padding], axis=1)  # [B, 32]
+    codes_32 = codes_32[:, :, None]  # [B, 32, 1] — single frame
+
+    # VQ decode: codes -> latent features [B, 512, 1]
+    latent = model.mimi.quantizer.decode(codes_32)  # [B, 512, 1]
+    latent = latent.transpose(0, 2, 1)  # [B, 1, 512]
+
+    # Project to thinker embedding space
+    return model.output_adaptor(latent)  # [B, 1, 4096]
+
+
 def tts_generate(
     model: RaonMLX,
     input_ids: mx.array,
@@ -184,77 +217,51 @@ def tts_generate(
     talker_cache = model.talker.make_cache()
 
     # Prefill: run input_ids through thinker
-    thinker_out = model.thinker(input_ids=input_ids, cache=thinker_cache)
-    text_logits = model.lm_head(thinker_out)
+    thinker_normed, thinker_pre_norm = model.thinker(input_ids=input_ids, cache=thinker_cache)
 
-    # Project to talker space
-    talker_input = model.thinker_to_talker_proj(thinker_out)
+    # Project PRE-NORM output to talker space (critical: talker sees unnormed hidden states)
+    talker_input = model.thinker_to_talker_proj(thinker_pre_norm)
     talker_out = model.talker(talker_input, cache=talker_cache)
 
-    # For TTS, force audio output: emit AUDIO_OUTPUT_PAD to start audio generation
-    # Sample first text token to check, but we force audio mode
-    sequences = input_ids
     audio_codes_list: list[mx.array] = []
     is_generating_audio = True
 
     # Generate first audio frame from prefill output
-    first_codes = generate_audio_codes(model, talker_out[:, -1:], temperature=audio_temperature, top_k=top_k)
-    audio_end = (first_codes[:, 0] == codebook_size).item()
-
-    if not audio_end:
-        audio_codes_list.append(first_codes)
-
-    # Append AUDIO_OUTPUT_PLACEHOLDER token for next step
-    next_token = mx.array([[AUDIO_OUTPUT_PLACEHOLDER]])
-    sequences = mx.concatenate([sequences, next_token], axis=1)
+    # Suppress AUDIO_END on first frame (model needs to produce at least some audio)
+    first_codes = generate_audio_codes(model, talker_out[:, -1:], temperature=audio_temperature, top_k=top_k,
+                                       suppress_eos=True)
+    audio_codes_list.append(first_codes)
 
     # Autoregressive loop
+    min_audio_frames = 5  # Don't allow AUDIO_END before generating at least this many frames
     for step in range(max_new_tokens - 1):
-        if audio_end:
-            break
+        # Feed audio code embeddings back to thinker (the critical feedback loop)
+        last_codes = audio_codes_list[-1]
+        audio_embed = _get_audio_output_embed(model, last_codes)  # [B, 1, 4096]
+        thinker_normed, thinker_pre_norm = model.thinker(inputs_embeds=audio_embed, cache=thinker_cache)
 
-        # Run single token through thinker
-        thinker_out = model.thinker(input_ids=next_token, cache=thinker_cache)
-        text_logits = model.lm_head(thinker_out)
-
-        # Project to talker
-        talker_input = model.thinker_to_talker_proj(thinker_out)
+        # Project PRE-NORM to talker
+        talker_input = model.thinker_to_talker_proj(thinker_pre_norm)
         talker_out = model.talker(talker_input, cache=talker_cache)
 
-        if is_generating_audio:
-            # Generate audio codes
-            codes = generate_audio_codes(model, talker_out, temperature=audio_temperature, top_k=top_k)
-            audio_end = (codes[:, 0] == codebook_size).item()
+        # Generate audio codes
+        suppress = len(audio_codes_list) < min_audio_frames
+        codes = generate_audio_codes(model, talker_out, temperature=audio_temperature, top_k=top_k,
+                                     suppress_eos=suppress)
+        audio_end = (codes[:, 0] == codebook_size).item()
 
-            if not audio_end:
-                audio_codes_list.append(codes)
-                next_token = mx.array([[AUDIO_OUTPUT_PLACEHOLDER]])
-            else:
-                next_token = mx.array([[AUDIO_END]])
-        else:
-            # Sample text token
-            next_logits = text_logits[:, -1]
-            next_logits_masked = next_logits.at[..., AUDIO_OUTPUT_PAD].add(float("-inf"))
-            next_token = sample_token(next_logits_masked, temperature=temperature, top_k=top_k, top_p=top_p)
-
-            if next_token.item() == IM_END:
-                break
-            if next_token.item() == AUDIO_START:
-                is_generating_audio = True
-                next_token = mx.array([[AUDIO_OUTPUT_PLACEHOLDER]])
-
-        sequences = mx.concatenate([sequences, next_token], axis=1)
+        if audio_end:
+            break
+        audio_codes_list.append(codes)
 
     if not audio_codes_list:
-        # No audio generated
         return mx.zeros((1, 0)), 24000
 
     # Stack audio codes: [num_frames, 16] -> [1, 16, num_frames] for Mimi
     all_codes = mx.stack(audio_codes_list, axis=1)  # [1, num_frames, 16]
-    all_codes = all_codes.transpose(0, 2, 1)  # [1, 16, num_frames] — Mimi expects [B, codebooks, frames]
+    all_codes = all_codes.transpose(0, 2, 1)  # [1, 16, num_frames]
 
     # Pad to 32 codebooks (Mimi uses 32, we only predict 16)
-    # Remaining 16 codebooks are zeros (acoustic refinement codes)
     padding = mx.zeros((1, 16, all_codes.shape[2]), dtype=all_codes.dtype)
     all_codes_32 = mx.concatenate([all_codes, padding], axis=1)  # [1, 32, num_frames]
 
