@@ -153,6 +153,97 @@ def generate_audio_codes(
     return all_codes
 
 
+def stt_generate(
+    model: RaonMLX,
+    input_ids: mx.array,
+    audio_embeds: mx.array,
+    audio_embeds_mask: mx.array,
+    max_new_tokens: int = 512,
+    temperature: float = 0.2,
+    top_k: int = 20,
+    top_p: float = 0.8,
+) -> list[int]:
+    """Generate text transcription from audio input (STT).
+
+    The audio embeddings are inserted at the AUDIO_INPUT_PLACEHOLDER positions
+    in the input sequence.
+
+    Args:
+        model: Full RaonMLX model with all weights loaded.
+        input_ids: Tokenized STT prompt with audio placeholders. Shape: [1, seq_len].
+        audio_embeds: Encoded audio embeddings from the audio encoder + input adaptor.
+            Shape: [1, num_frames, 4096].
+        audio_embeds_mask: Valid frame mask. Shape: [1, num_frames].
+        max_new_tokens: Maximum tokens to generate.
+        temperature: Sampling temperature (lower = more deterministic for STT).
+        top_k: Top-k filtering.
+        top_p: Top-p filtering.
+
+    Returns:
+        List of generated token IDs (decode with tokenizer to get text).
+    """
+    AUDIO_INPUT_PLACEHOLDER = 151676  # <|audio_input_placeholder|>
+
+    # Build input embeddings, replacing audio placeholders with audio embeds
+    AUDIO_INPUT_PLACEHOLDER = 151676
+
+    inputs_embeds = model.thinker.embed_tokens(input_ids)  # [1, seq_len, 4096]
+
+    # Find placeholder range (they're consecutive)
+    input_ids_list = input_ids[0].tolist()
+    first_ph = None
+    last_ph = None
+    for i, tid in enumerate(input_ids_list):
+        if tid == AUDIO_INPUT_PLACEHOLDER:
+            if first_ph is None:
+                first_ph = i
+            last_ph = i
+
+    if first_ph is not None and audio_embeds.shape[1] > 0:
+        n_placeholders = last_ph - first_ph + 1
+        n_audio = audio_embeds.shape[1]
+        n_replace = min(n_placeholders, n_audio)
+
+        # Build new embeddings: [before_placeholders | audio_embeds | after_placeholders]
+        audio_embeds_cast = audio_embeds[:, :n_replace].astype(inputs_embeds.dtype)
+        before = inputs_embeds[:, :first_ph, :]
+        after = inputs_embeds[:, first_ph + n_replace:, :]
+        inputs_embeds = mx.concatenate([before, audio_embeds_cast, after], axis=1)
+
+    # Create KV caches
+    thinker_cache = model.thinker.make_cache()
+
+    # Prefill
+    thinker_normed, _ = model.thinker(inputs_embeds=inputs_embeds, cache=thinker_cache)
+    text_logits = model.lm_head(thinker_normed)
+
+    # Autoregressive text generation
+    generated_ids = []
+    for step in range(max_new_tokens):
+        next_logits = text_logits[:, -1]
+
+        # Suppress audio tokens during STT
+        next_logits = next_logits.at[:, AUDIO_OUTPUT_PAD].add(-1e9)
+
+        if temperature > 0:
+            next_token = sample_token(next_logits, temperature=temperature, top_k=top_k, top_p=top_p)
+        else:
+            next_token = next_logits.argmax(axis=-1, keepdims=True)
+
+        token_id = next_token[0, 0].item()
+
+        if token_id == IM_END:
+            break
+
+        generated_ids.append(token_id)
+
+        # Feed back through thinker
+        thinker_normed, _ = model.thinker(input_ids=next_token, cache=thinker_cache)
+        text_logits = model.lm_head(thinker_normed)
+
+    return generated_ids
+
+
 def _get_audio_output_embed(model: RaonMLX, codes: mx.array) -> mx.array:
     """Convert generated audio codes to thinker input embeddings.
 
