@@ -8,17 +8,31 @@ Audio files to evaluate. All generated on M5 Max with hybrid quantization (4-bit
 # Activate environment
 source .venv/bin/activate
 
-# Convert model (one time, ~2s, produces 6.46 GB):
-python -m raon_mlx.utils.convert models/Raon-Speech-9B -o models/Raon-Speech-9B-mlx-hybrid
+# TTS (from HF checkpoint, quantizes on-the-fly):
+python -m raon_mlx.tts "Your text here" --model models/Raon-Speech-9B --quant hybrid -o output/test.wav
 
-# Generate TTS:
+# TTS with speaker cloning:
+python -m raon_mlx.tts "Your text here" --model models/Raon-Speech-9B --speaker data/duplex/eval/audio/spk_ref.wav -o output/clone.wav
+
+# STT:
+python -m raon_mlx.stt audio.wav --hf-model models/Raon-Speech-9B
+
+# Gradio demo (all tasks in browser):
+python demo/gradio_mlx_demo.py --model models/Raon-Speech-9B --port 7880
+
+# Optional: pre-convert for faster TTS loading (6.46 GB):
+python -m raon_mlx.utils.convert models/Raon-Speech-9B -o models/Raon-Speech-9B-mlx-hybrid
 python -m raon_mlx.tts "Your text here" --model models/Raon-Speech-9B-mlx-hybrid -o output/test.wav
 
-# With speaker cloning:
-python -m raon_mlx.tts "Your text here" --model models/Raon-Speech-9B-mlx-hybrid --speaker data/duplex/eval/audio/spk_ref.wav -o output/clone.wav
-
-# From HF checkpoint (slower, quantizes on-the-fly):
-python -m raon_mlx.tts "Your text here" --model models/Raon-Speech-9B --quant hybrid -o output/test.wav
+# Python API:
+python -c "
+from raon_mlx.pipeline import RaonMLXPipeline
+pipe = RaonMLXPipeline('models/Raon-Speech-9B', quant='hybrid')
+audio, sr = pipe.tts('Hello world!')
+pipe.save_audio((audio, sr), 'output/test.wav')
+text = pipe.stt('output/test.wav')
+print(text)
+"
 ```
 
 ## Tests to Run
@@ -138,6 +152,37 @@ time python -m raon_mlx.tts "This is a longer sentence designed to test the sust
 - [ ] RTF < 1.0 (real-time or faster)
 - [ ] Model loads instantly from pre-converted weights
 - [ ] No memory errors or crashes
+
+### 7. Gradio Demo
+
+```bash
+python demo/gradio_mlx_demo.py --model models/Raon-Speech-9B --port 7880
+# Open http://localhost:7880
+```
+
+- [ ] Demo launches without errors
+- [ ] TTS task: enter text, click Generate, hear audio
+- [ ] STT task: upload/record audio, click Generate, see transcription
+- [ ] SpeechChat task: upload audio, get text response
+- [ ] Speaker reference: upload ref audio for TTS, voice changes
+
+### 8. Pipeline API
+
+```python
+from raon_mlx.pipeline import RaonMLXPipeline
+pipe = RaonMLXPipeline("models/Raon-Speech-9B", quant="hybrid")
+
+# TTS roundtrip
+audio, sr = pipe.tts("Testing the pipeline API.")
+pipe.save_audio((audio, sr), "output/pipe_test.wav")
+text = pipe.stt("output/pipe_test.wav")
+print(text)  # Should be close to "Testing the pipeline API."
+```
+
+- [ ] Pipeline loads without errors
+- [ ] TTS produces audio
+- [ ] STT transcribes correctly
+- [ ] TTS → STT roundtrip produces recognizable text
 
 ## Known Issues
 
