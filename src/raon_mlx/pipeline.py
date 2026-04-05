@@ -258,6 +258,69 @@ class RaonMLXPipeline:
         audio_out, sr = self.tts(text_response, speaker_audio=speaker_audio, seed=seed)
         return text_response, audio_out, sr
 
+    def duplex(
+        self,
+        audio_input: str,
+        output_dir: str,
+        *,
+        system_prompt: str | None = None,
+        speak_first: bool = False,
+        temperature: float = 0.9,
+        top_k: int = 66,
+        top_p: float = 0.99,
+        eos_penalty: float = 0.0,
+        sil_penalty: float = 0.0,
+        bc_penalty: float = 0.0,
+        speaker_audio: str | None = None,
+    ) -> dict:
+        """Run full-duplex inference on an audio file.
+
+        Processes audio frame-by-frame (80ms at 24kHz), simultaneously encoding
+        user speech and generating assistant speech. Saves output audio, transcript,
+        and summary to output_dir.
+
+        Args:
+            audio_input: Path to input audio WAV file.
+            output_dir: Directory to save output files.
+            system_prompt: System prompt text. Defaults to duplex conversation prompt.
+            speak_first: If True, model speaks first.
+            temperature: Sampling temperature.
+            top_k: Top-k filtering.
+            top_p: Top-p sampling.
+            eos_penalty: Penalty on PAD token to encourage longer speech.
+            sil_penalty: Penalty on SIL token to reduce silence.
+            bc_penalty: Penalty on BC token.
+            speaker_audio: Optional speaker reference audio path.
+
+        Returns:
+            Summary dict with durations, RTF, and transcript.
+        """
+        from .models.duplex_generate import run_duplex_offline
+
+        if system_prompt is None:
+            system_prompt = "You are engaging in real-time conversation."
+
+        speaker_embeds = None
+        if speaker_audio is not None:
+            from .utils.speaker import compute_speaker_embedding
+            speaker_embeds = compute_speaker_embedding(speaker_audio)
+
+        return run_duplex_offline(
+            model=self.model,
+            tokenizer=self.processor.tokenizer,
+            audio_path=audio_input,
+            output_dir=output_dir,
+            system_prompt=system_prompt,
+            speak_first=speak_first,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            eos_penalty=eos_penalty,
+            sil_penalty=sil_penalty,
+            bc_penalty=bc_penalty,
+            speaker_embeds=speaker_embeds,
+        )
+
     @staticmethod
     def save_audio(audio_data: tuple, path: str) -> None:
         """Save (waveform, sr) tuple to a WAV file."""
