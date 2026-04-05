@@ -46,6 +46,9 @@ dev = [
     "pytest-forked>=1.6.0",
     "ruff>=0.7.0",
 ]
+mlx = [
+    "mlx>=0.31.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/YOUR_ORG/raon"
