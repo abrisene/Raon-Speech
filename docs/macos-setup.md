@@ -17,7 +17,7 @@ source .venv/bin/activate
 
 # Install deps
 uv pip install -r requirements.txt -e .
-uv pip install 'huggingface_hub[cli]' mlx gradio
+uv pip install 'huggingface_hub[cli]' mlx mlx-lm gradio
 
 # Download models (requires HF login: `hf auth login`)
 hf download KRAFTON/Raon-Speech-9B --local-dir models/Raon-Speech-9B
