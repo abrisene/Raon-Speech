@@ -47,6 +47,10 @@ class KVCache:
         self.values[..., prev : self.offset, :] = values
         return self.keys[..., : self.offset, :], self.values[..., : self.offset, :]
 
+    def rewind(self, n: int) -> None:
+        """Roll back the cache offset by n positions, allowing overwrite."""
+        self.offset = max(0, self.offset - n)
+
     def reset(self):
         self.offset = 0
         self.keys = None

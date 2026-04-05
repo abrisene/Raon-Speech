@@ -175,13 +175,17 @@ def init_duplex_state(
     audio_codes = mx.zeros((1, 0, NUM_CODE_GROUPS), dtype=mx.int32)
     audio_codes_mask = mx.zeros((1, 0), dtype=mx.bool_)
 
+    # Run talker on init prefill output (keeps talker cache aligned with thinker)
+    init_talker_input = model.thinker_to_talker_proj(thinker_pre_norm)
+    init_talker_out = model.talker(init_talker_input, cache=talker_cache)
+
     (
         new_sequences, new_audio_codes, new_audio_codes_mask,
         new_machine_state, first_frame_codes,
     ) = _update_duplex_sequences_and_generate_audio_codes(
         model=model,
         text_logits=text_logits,
-        talker_hidden=thinker_pre_norm,
+        talker_out=init_talker_out,
         sequences=sequences,
         audio_codes=audio_codes,
         audio_codes_mask=audio_codes_mask,
@@ -193,7 +197,6 @@ def init_duplex_state(
         eos_penalty=eos_penalty,
         sil_penalty=sil_penalty,
         bc_penalty=bc_penalty,
-        talker_cache=talker_cache,
     )
 
     # Run the newly appended frame tokens through the thinker to update KV cache.
@@ -214,7 +217,10 @@ def init_duplex_state(
                 new_embeds[:, :-1, :],
                 feedback_embed,
             ], axis=1)
-        model.thinker(inputs_embeds=new_embeds, cache=thinker_cache)
+        _, thinker_pre_norm_frame = model.thinker(inputs_embeds=new_embeds, cache=thinker_cache)
+        # Also run through talker to keep its cache aligned
+        talker_frame_input = model.thinker_to_talker_proj(thinker_pre_norm_frame)
+        model.talker(talker_frame_input, cache=talker_cache)
 
     # Reset Mimi streaming state
     model.mimi.reset_all()
@@ -283,18 +289,21 @@ def duplex_step(
     # 1. Encode user audio via PyTorch streaming encoder
     assert state.streaming_encoder is not None, "streaming_encoder required for duplex"
     audio_input_embeds = _encode_user_audio(state.streaming_encoder, audio_input)
-    # audio_input_embeds: [1, num_frames, 4096] — may be 0 frames if encoder is buffering
 
-    # If encoder produced 0 frames (buffering mel), use a zero embedding
     if audio_input_embeds.shape[1] == 0:
         audio_input_embeds = mx.zeros((1, 1, 4096))
-
-    # Use only the last frame if multiple were produced
     if audio_input_embeds.shape[1] > 1:
         audio_input_embeds = audio_input_embeds[:, -1:, :]
 
-    # 2. Build thinker input from last frame tokens
+    # 2. Build thinker input from last frame tokens.
+    # CRITICAL: The last frame tokens are ALREADY in the thinker KV cache
+    # (cached in the previous step or during init). We need to OVERWRITE
+    # those cache positions with the real audio embeddings. Rewind the
+    # cache by num_input_tokens, then re-process with audio injected.
     num_input_tokens = state.machine_state.num_input_tokens
+    for cache in state.thinker_cache:
+        cache.rewind(num_input_tokens)
+
     last_tokens = state.sequences[:, -num_input_tokens:]
     frame_embeds = model.thinker.embed_tokens(last_tokens)
     last_tokens_list = last_tokens[0].tolist()
@@ -318,11 +327,18 @@ def duplex_step(
                 )
                 break
 
-    # 3. Thinker forward (cached)
+    # 3. Thinker forward (cached) — overwrites the last N positions
     thinker_normed, thinker_pre_norm = model.thinker(
         inputs_embeds=frame_embeds, cache=state.thinker_cache,
     )
     text_logits = model.lm_head(thinker_normed)
+
+    # 3b. Talker forward — must run on EVERY frame to keep talker KV cache
+    # aligned with thinker. PyTorch inference_forward runs talker unconditionally.
+    for cache in state.talker_cache:
+        cache.rewind(num_input_tokens)
+    talker_input = model.thinker_to_talker_proj(thinker_pre_norm)
+    talker_out = model.talker(talker_input, cache=state.talker_cache)
 
     # 4. Force SIL if in warmup
     if state.forced_sil_remaining > 0 and state.state_manager.config.use_sil_token:
@@ -338,7 +354,7 @@ def duplex_step(
     ) = _update_duplex_sequences_and_generate_audio_codes(
         model=model,
         text_logits=text_logits,
-        talker_hidden=thinker_pre_norm,
+        talker_out=talker_out,
         sequences=state.sequences,
         audio_codes=state.audio_codes,
         audio_codes_mask=state.audio_codes_mask,
@@ -350,7 +366,6 @@ def duplex_step(
         eos_penalty=state.eos_penalty,
         sil_penalty=state.sil_penalty,
         bc_penalty=state.bc_penalty,
-        talker_cache=state.talker_cache,
     )
 
     # 6. Decode audio output
@@ -424,7 +439,7 @@ def _update_duplex_sequences_and_generate_audio_codes(
     *,
     model: RaonMLX,
     text_logits: mx.array,
-    talker_hidden: mx.array,
+    talker_out: mx.array,
     sequences: mx.array,
     audio_codes: mx.array,
     audio_codes_mask: mx.array,
@@ -436,9 +451,12 @@ def _update_duplex_sequences_and_generate_audio_codes(
     eos_penalty: float,
     sil_penalty: float,
     bc_penalty: float,
-    talker_cache: list[KVCache],
 ) -> tuple[mx.array, mx.array, mx.array, DuplexMachineState, mx.array | None]:
     """Sample text prediction, generate audio codes, update sequences.
+
+    The talker has already been run by the caller (duplex_step runs it on every
+    frame to keep its KV cache aligned). We use the pre-computed talker_out
+    for audio code generation.
 
     Returns:
         (new_sequences, new_audio_codes, new_audio_codes_mask, new_machine_state, frame_codes)
@@ -478,15 +496,13 @@ def _update_duplex_sequences_and_generate_audio_codes(
 
     predicted_id = predicted_token[0, 0].item()
 
-    # Generate audio codes if in SPEECH phase (pre-transition)
+    # Generate audio codes using pre-computed talker output
     is_in_speech = machine_state.phase == DuplexPhase.SPEECH
     new_audio_codes_frame = None
 
     if is_in_speech:
-        talker_input = model.thinker_to_talker_proj(talker_hidden[:, -1:])
-        talker_out = model.talker(talker_input, cache=talker_cache)
         new_audio_codes_frame = generate_audio_codes(
-            model, talker_out, temperature=1.2, top_k=top_k, suppress_eos=True,
+            model, talker_out[:, -1:], temperature=1.2, top_k=top_k, suppress_eos=True,
         )
 
     # State machine transition
@@ -494,12 +510,10 @@ def _update_duplex_sequences_and_generate_audio_codes(
         machine_state, predicted_id,
     )
 
-    # Onset frame (SIL -> SPEECH): generate codes now
+    # Onset frame (SIL -> SPEECH): generate codes from talker output
     if emitted_audio and new_audio_codes_frame is None:
-        talker_input = model.thinker_to_talker_proj(talker_hidden[:, -1:])
-        talker_out = model.talker(talker_input, cache=talker_cache)
         new_audio_codes_frame = generate_audio_codes(
-            model, talker_out, temperature=1.2, top_k=top_k, suppress_eos=True,
+            model, talker_out[:, -1:], temperature=1.2, top_k=top_k, suppress_eos=True,
         )
 
     # Append audio codes
