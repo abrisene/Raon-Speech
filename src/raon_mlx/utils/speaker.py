@@ -38,8 +38,18 @@ def extract_speaker_embedding(
     import torchaudio
     import soundfile as sf
 
-    # Load audio
-    audio, sr = sf.read(audio_path)
+    # Load audio (handles WAV, MP3, FLAC, etc. via soundfile/ffmpeg)
+    try:
+        audio, sr = sf.read(audio_path)
+    except Exception:
+        # Fallback for formats soundfile can't handle (e.g. some MP3s)
+        import subprocess, io, tempfile
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        subprocess.run(["ffmpeg", "-i", audio_path, "-ar", "24000", "-ac", "1", "-y", tmp.name],
+                       capture_output=True, check=True)
+        audio, sr = sf.read(tmp.name)
+        os.unlink(tmp.name)
+
     if audio.ndim > 1:
         audio = audio.mean(axis=1)  # mono
 
@@ -53,7 +63,7 @@ def extract_speaker_embedding(
     # Resample to 16kHz for ECAPA-TDNN
     audio_16k = torchaudio.functional.resample(audio_t, orig_freq=sr, new_freq=16000)
 
-    # Truncate to max_seconds
+    # Truncate to max_seconds (speaker embedding only needs a few seconds)
     max_samples = int(max_seconds * 16000)
     if audio_16k.shape[1] > max_samples:
         audio_16k = audio_16k[:, :max_samples]
