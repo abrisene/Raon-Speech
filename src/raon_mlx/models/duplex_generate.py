@@ -204,6 +204,8 @@ def init_duplex_state(
     # _update_duplex_sequences appended frame tokens (e.g. [AIP, SIL/text, AOP])
     # to sequences but didn't run them through the thinker. We need the cache
     # to include these so the next duplex_step's attention is correctly aligned.
+    # Run the newly appended frame tokens through thinker + talker with explicit
+    # cache_position so they're written at the correct positions.
     num_new_tokens = new_sequences.shape[1] - sequences.shape[1]
     if num_new_tokens > 0:
         new_token_ids = new_sequences[:, -num_new_tokens:]
@@ -212,15 +214,27 @@ def init_duplex_state(
         if new_machine_state.emitted_audio and new_audio_codes.shape[1] > 0:
             last_codes = new_audio_codes[:, -1, :]
             feedback_embed = _get_audio_output_embed(model, last_codes)
-            # AOP is the last token in the frame
             new_embeds = mx.concatenate([
                 new_embeds[:, :-1, :],
                 feedback_embed,
             ], axis=1)
-        _, thinker_pre_norm_frame = model.thinker(inputs_embeds=new_embeds, cache=thinker_cache)
-        # Also run through talker to keep its cache aligned
+
+        # Explicit positions: these tokens are at the END of the sequence
+        init_cache_pos = mx.arange(
+            new_sequences.shape[1] - num_new_tokens,
+            new_sequences.shape[1],
+        )
+        init_pos_ids = init_cache_pos[None, :]
+
+        _, thinker_pre_norm_frame = model.thinker(
+            inputs_embeds=new_embeds, cache=thinker_cache,
+            position_ids=init_pos_ids, cache_position=init_cache_pos,
+        )
         talker_frame_input = model.thinker_to_talker_proj(thinker_pre_norm_frame)
-        model.talker(talker_frame_input, cache=talker_cache)
+        model.talker(
+            talker_frame_input, cache=talker_cache,
+            position_ids=init_pos_ids, cache_position=init_cache_pos,
+        )
 
     # Reset Mimi streaming state
     model.mimi.reset_all()
@@ -296,13 +310,16 @@ def duplex_step(
         audio_input_embeds = audio_input_embeds[:, -1:, :]
 
     # 2. Build thinker input from last frame tokens.
-    # CRITICAL: The last frame tokens are ALREADY in the thinker KV cache
-    # (cached in the previous step or during init). We need to OVERWRITE
-    # those cache positions with the real audio embeddings. Rewind the
-    # cache by num_input_tokens, then re-process with audio injected.
+    # The last frame tokens are ALREADY in the KV cache from the previous step.
+    # We OVERWRITE those cache positions with new K/V that include the real audio
+    # embeddings, using explicit cache_position (matching PyTorch behavior).
     num_input_tokens = state.machine_state.num_input_tokens
-    for cache in state.thinker_cache:
-        cache.rewind(num_input_tokens)
+    seq_len = state.sequences.shape[1]
+
+    # Compute explicit position_ids and cache_position for the last N tokens
+    # (same as PyTorch: cache_position = arange(seq_len - N, seq_len))
+    cache_pos = mx.arange(seq_len - num_input_tokens, seq_len)
+    position_ids = cache_pos[None, :]  # [1, N]
 
     last_tokens = state.sequences[:, -num_input_tokens:]
     frame_embeds = model.thinker.embed_tokens(last_tokens)
@@ -327,18 +344,18 @@ def duplex_step(
                 )
                 break
 
-    # 3. Thinker forward (cached) — overwrites the last N positions
+    # 3. Thinker forward with explicit positions — overwrites cache at those positions
     thinker_normed, thinker_pre_norm = model.thinker(
         inputs_embeds=frame_embeds, cache=state.thinker_cache,
+        position_ids=position_ids, cache_position=cache_pos,
     )
     text_logits = model.lm_head(thinker_normed)
 
-    # 3b. Talker forward — must run on EVERY frame to keep talker KV cache
-    # aligned with thinker. PyTorch inference_forward runs talker unconditionally.
-    for cache in state.talker_cache:
-        cache.rewind(num_input_tokens)
+    # 3b. Talker forward — must run on EVERY frame to keep cache aligned.
+    # Uses same position_ids/cache_position as thinker.
     talker_input = model.thinker_to_talker_proj(thinker_pre_norm)
-    talker_out = model.talker(talker_input, cache=state.talker_cache)
+    talker_out = model.talker(talker_input, cache=state.talker_cache,
+                               position_ids=position_ids, cache_position=cache_pos)
 
     # 4. Force SIL if in warmup
     if state.forced_sil_remaining > 0 and state.state_manager.config.use_sil_token:

@@ -45,14 +45,23 @@ class Qwen3RotaryEmbedding(nn.Module):
         self.head_dim = head_dim
         self.theta = theta
 
-    def __call__(self, q: mx.array, k: mx.array, offset: int = 0) -> tuple[mx.array, mx.array]:
-        seq_len = q.shape[2]
-        positions = mx.arange(offset, offset + seq_len, dtype=mx.float32)
+    def __call__(
+        self,
+        q: mx.array,
+        k: mx.array,
+        offset: int = 0,
+        position_ids: mx.array | None = None,
+    ) -> tuple[mx.array, mx.array]:
+        if position_ids is not None:
+            # Explicit positions [1, seq_len] or [seq_len] — for duplex cache overwrite
+            positions = position_ids.reshape(-1).astype(mx.float32)
+        else:
+            seq_len = q.shape[2]
+            positions = mx.arange(offset, offset + seq_len, dtype=mx.float32)
         dim = self.head_dim
         freqs = positions[:, None] / mx.power(self.theta, mx.arange(0, dim, 2, dtype=mx.float32) / dim)
         cos = mx.cos(freqs)  # [seq_len, dim//2]
         sin = mx.sin(freqs)  # [seq_len, dim//2]
-        # Apply rotary embeddings
         q = _apply_rope(q, cos, sin)
         k = _apply_rope(k, cos, sin)
         return q, k
@@ -94,6 +103,8 @@ class Qwen3Attention(nn.Module):
         xs: mx.array,
         cache: KVCache | None = None,
         mask: mx.array | None = None,
+        position_ids: mx.array | None = None,
+        cache_position: mx.array | None = None,
     ) -> mx.array:
         B, T, _ = xs.shape
 
@@ -105,13 +116,16 @@ class Qwen3Attention(nn.Module):
         q = self.q_norm(q)
         k = self.k_norm(k)
 
-        # RoPE
-        offset = cache.offset if cache is not None else 0
-        q, k = self.rope(q, k, offset=offset)
+        # RoPE — use explicit position_ids if provided (for duplex cache overwrite)
+        if position_ids is not None:
+            q, k = self.rope(q, k, offset=0, position_ids=position_ids)
+        else:
+            offset = cache.offset if cache is not None else 0
+            q, k = self.rope(q, k, offset=offset)
 
-        # KV cache
+        # KV cache — use explicit cache_position if provided
         if cache is not None:
-            k, v = cache.update_and_fetch(k, v)
+            k, v = cache.update_and_fetch(k, v, cache_position=cache_position)
 
         # GQA: repeat KV heads to match Q heads
         if self.n_kv_heads < self.n_heads:
@@ -150,10 +164,12 @@ class Qwen3DecoderLayer(nn.Module):
         xs: mx.array,
         cache: KVCache | None = None,
         mask: mx.array | None = None,
+        position_ids: mx.array | None = None,
+        cache_position: mx.array | None = None,
     ) -> mx.array:
         residual = xs
         xs = self.input_layernorm(xs)
-        xs = self.self_attn(xs, cache=cache, mask=mask)
+        xs = self.self_attn(xs, cache=cache, mask=mask, position_ids=position_ids, cache_position=cache_position)
         xs = residual + xs
 
         residual = xs
@@ -185,13 +201,25 @@ class Qwen3Model(nn.Module):
         inputs_embeds: mx.array | None = None,
         cache: list[KVCache] | None = None,
         mask: mx.array | None = None,
+        position_ids: mx.array | None = None,
+        cache_position: mx.array | None = None,
     ) -> tuple[mx.array, mx.array]:
         """Forward pass through the Qwen3 model.
 
+        Args:
+            input_ids: Token IDs [B, T]. Mutually exclusive with inputs_embeds.
+            inputs_embeds: Pre-computed embeddings [B, T, D].
+            cache: KV caches for each layer.
+            mask: Attention mask [T, total_len].
+            position_ids: Explicit position indices [1, T] for RoPE.
+                If provided, uses these instead of auto-incrementing from cache offset.
+                Required for duplex cache overwrite (re-processing frames with audio).
+            cache_position: Explicit cache write positions [T].
+                If provided, writes K/V at these positions instead of appending.
+                Required for duplex cache overwrite.
+
         Returns:
             Tuple of (normed_output, pre_norm_output).
-            normed_output: After final RMSNorm — used for lm_head/text logits.
-            pre_norm_output: Last layer output before norm — used for talker projection.
         """
         if inputs_embeds is None:
             assert input_ids is not None
@@ -199,15 +227,20 @@ class Qwen3Model(nn.Module):
         else:
             xs = inputs_embeds
 
-        # Build causal mask if not provided and seq_len > 1
+        # Build causal mask
         if mask is None and xs.shape[1] > 1:
-            offset = cache[0].offset if cache is not None else 0
-            mask = create_additive_causal_mask(xs.shape[1], offset)
+            if cache_position is not None:
+                # Duplex mode: mask based on explicit positions
+                offset = int(cache_position[0].item())
+                mask = create_additive_causal_mask(xs.shape[1], offset)
+            else:
+                offset = cache[0].offset if cache is not None else 0
+                mask = create_additive_causal_mask(xs.shape[1], offset)
             mask = mask.astype(xs.dtype)
 
         for i, layer in enumerate(self.layers):
             layer_cache = cache[i] if cache is not None else None
-            xs = layer(xs, cache=layer_cache, mask=mask)
+            xs = layer(xs, cache=layer_cache, mask=mask, position_ids=position_ids, cache_position=cache_position)
 
         pre_norm = xs
         return self.norm(xs), pre_norm

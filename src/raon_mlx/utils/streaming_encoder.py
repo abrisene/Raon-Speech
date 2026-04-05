@@ -83,13 +83,45 @@ class StreamingAudioEncoder:
         import torch
         from transformers.models.voxtral_realtime.configuration_voxtral_realtime import VoxtralRealtimeEncoderConfig
         from raon.modules.voxtral_wrapper import VoxtralWrapper
+        from raon.utils.misc import load_safetensors_by_prefix
 
         vox_cfg = VoxtralRealtimeEncoderConfig(**ae_cfg)
-        # Ensure rope_theta is set (config class may not map it from the raw dict)
         if not hasattr(vox_cfg, "rope_theta") or getattr(vox_cfg, "rope_theta", None) is None:
             vox_cfg.rope_theta = ae_cfg.get("rope_theta", 1000000.0)
-        self._encoder = VoxtralWrapper.from_pretrained(model_path, config=vox_cfg, dtype=torch.float32)
-        self._encoder.requires_grad_(False)
+
+        # Build wrapper with random weights
+        wrapper = VoxtralWrapper.from_config(vox_cfg, dtype=torch.float32)
+
+        # Load encoder weights with the correct prefix for this checkpoint.
+        # Raon-SpeechChat-9B uses 'audio_encoder.encoder.' (not 'audio_tower.')
+        enc_state = load_safetensors_by_prefix(
+            model_path,
+            prefixes={"enc": "audio_encoder.encoder."},
+            dtype=torch.float32,
+        )
+        enc_weights = enc_state.get("enc", {})
+        if not enc_weights:
+            # Fallback: try audio_tower. prefix (standard Voxtral checkpoints)
+            enc_state = load_safetensors_by_prefix(
+                model_path,
+                prefixes={"enc": "audio_tower."},
+                dtype=torch.float32,
+            )
+            enc_weights = enc_state.get("enc", {})
+
+        if enc_weights:
+            result = wrapper.encoder.load_state_dict(enc_weights, strict=False)
+            logger.info(
+                "Voxtral encoder loaded: %d params, %d missing, %d unexpected",
+                len(enc_weights), len(result.missing_keys), len(result.unexpected_keys),
+            )
+            if result.missing_keys:
+                logger.warning("Missing encoder keys: %s", result.missing_keys[:5])
+        else:
+            logger.error("No encoder weights found! Audio encoding will be random.")
+
+        wrapper.requires_grad_(False)
+        self._encoder = wrapper
         self._encoder_type = "voxtral"
 
     def _load_aut(self, model_path: str, ae_cfg: dict) -> None:

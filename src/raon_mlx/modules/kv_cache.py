@@ -22,7 +22,50 @@ class KVCache:
         self.offset = 0
         self.step = 256
 
-    def update_and_fetch(self, keys: mx.array, values: mx.array) -> tuple[mx.array, mx.array]:
+    def update_and_fetch(
+        self,
+        keys: mx.array,
+        values: mx.array,
+        cache_position: mx.array | None = None,
+    ) -> tuple[mx.array, mx.array]:
+        """Update cache with new keys/values and return full cache.
+
+        Args:
+            keys: New key states [B, n_kv_heads, S, head_dim].
+            values: New value states [B, n_kv_heads, S, head_dim].
+            cache_position: If provided, explicit positions to write [S].
+                This enables overwriting specific cache positions (for duplex).
+                If None, appends sequentially at self.offset (standard behavior).
+        """
+        if cache_position is not None:
+            # Explicit position mode: write K/V at specified positions
+            pos = cache_position.tolist() if hasattr(cache_position, 'tolist') else list(cache_position)
+            max_pos = max(pos) + 1
+
+            # Ensure cache is large enough
+            if self.keys is None or max_pos > self.keys.shape[2]:
+                B = keys.shape[0]
+                target_size = ((max_pos + self.step - 1) // self.step) * self.step
+                k_shape = (B, self.n_kv_heads, target_size, self.k_head_dim)
+                v_shape = (B, self.n_kv_heads, target_size, self.v_head_dim)
+                new_k = mx.zeros(k_shape, keys.dtype)
+                new_v = mx.zeros(v_shape, values.dtype)
+                if self.keys is not None:
+                    old_len = self.keys.shape[2]
+                    new_k[..., :old_len, :] = self.keys[..., :old_len, :]
+                    new_v[..., :old_len, :] = self.values[..., :old_len, :]
+                self.keys = new_k
+                self.values = new_v
+
+            # Write at explicit positions
+            for i, p in enumerate(pos):
+                self.keys[..., p:p+1, :] = keys[..., i:i+1, :]
+                self.values[..., p:p+1, :] = values[..., i:i+1, :]
+
+            self.offset = max_pos
+            return self.keys[..., :self.offset, :], self.values[..., :self.offset, :]
+
+        # Standard sequential append mode
         prev = self.offset
         if self.keys is None or (prev + keys.shape[2]) > self.keys.shape[2]:
             B = keys.shape[0]

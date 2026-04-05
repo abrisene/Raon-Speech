@@ -111,15 +111,20 @@ class Talker(nn.Module):
         xs: mx.array,
         cache: list[KVCache] | None = None,
         mask: mx.array | None = None,
+        position_ids: mx.array | None = None,
+        cache_position: mx.array | None = None,
     ) -> mx.array:
         if mask is None and xs.shape[1] > 1:
-            offset = cache[0].offset if cache is not None else 0
+            if cache_position is not None:
+                offset = int(cache_position[0].item())
+            else:
+                offset = cache[0].offset if cache is not None else 0
             mask = create_additive_causal_mask(xs.shape[1], offset)
             mask = mask.astype(xs.dtype)
 
         for i, layer in enumerate(self.layers):
             layer_cache = cache[i] if cache is not None else None
-            xs = layer(xs, cache=layer_cache, mask=mask)
+            xs = layer(xs, cache=layer_cache, mask=mask, position_ids=position_ids, cache_position=cache_position)
         return self.norm(xs)
 
     def make_cache(self) -> list[KVCache]:
