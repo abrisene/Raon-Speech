@@ -159,6 +159,10 @@ class DuplexStateManager:
     ) -> mx.array:
         """Mask logits to enforce valid state-machine transitions.
 
+        Builds an additive mask (0 for allowed, -inf for blocked) using
+        numpy for construction, then converts to mx.array for the final add.
+        Avoids -inf + inf = NaN issues with pure MLX at() operations.
+
         Args:
             user_logits: Shape [1, 1, vocab] or [1, seq, vocab].
             state: Current machine state.
@@ -167,6 +171,8 @@ class DuplexStateManager:
         Returns:
             Masked logits with invalid tokens set to -inf.
         """
+        import numpy as np
+
         cfg = self._config
         sil_id = cfg.duplex_sil_token_id
         epad_id = cfg.duplex_end_pad_token_id
@@ -177,60 +183,58 @@ class DuplexStateManager:
         if cfg.use_backchannel_token:
             onset_ids.add(bc_id)
 
-        # Start with all -inf, selectively allow tokens
-        mask = mx.full(user_logits.shape, float("-inf"))
-        max_token_id = mask.shape[-1]
-
-        def _allow(token_id: int) -> None:
-            nonlocal mask
-            if token_id < max_token_id:
-                mask = mask.at[..., token_id].add(float("inf"))
+        V = user_logits.shape[-1]
+        # Build mask in numpy: 0.0 = allowed, -inf = blocked
+        mask_np = np.full(V, -np.inf, dtype=np.float32)
 
         if state.phase == DuplexPhase.SIL:
-            _allow(sil_id)
-            if cfg.use_duplex_end_pad:
-                _allow(epad_id)
-            if cfg.use_backchannel_token:
-                _allow(bc_id)
+            # Only SIL, EPAD, and optionally BC allowed
+            if 0 <= sil_id < V:
+                mask_np[sil_id] = 0.0
+            if cfg.use_duplex_end_pad and 0 <= epad_id < V:
+                mask_np[epad_id] = 0.0
+            if cfg.use_backchannel_token and 0 <= bc_id < V:
+                mask_np[bc_id] = 0.0
+
         elif state.phase == DuplexPhase.SPEECH:
             context_token = self._extract_context_token(state)
 
             if context_token is not None and context_token in onset_ids:
                 # After EPAD/BC onset: only text tokens allowed
-                # Allow all text vocab, then block structural + control tokens
-                allow_mask = mx.zeros(user_logits.shape)
-                allow_mask = allow_mask.at[..., :vocab_size].add(0.0)
-                mask = mx.zeros(user_logits.shape)  # start from 0
+                mask_np[:vocab_size] = 0.0
+                # Block structural + control tokens
                 for block_id in BLOCKED_STRUCTURAL | {sil_id, pad_id} | onset_ids:
-                    if block_id < max_token_id:
-                        mask = mask.at[..., block_id].add(float("-inf"))
-                return user_logits + mask
+                    if 0 <= block_id < V:
+                        mask_np[block_id] = -np.inf
 
             elif (
                 context_token is not None
                 and context_token not in (BLOCKED_STRUCTURAL | onset_ids | {pad_id, sil_id})
             ):
                 # After text: text + PAD + EPAD + SIL allowed
-                mask = mx.zeros(user_logits.shape)
-                # Block everything above vocab_size except allowed control tokens
-                if max_token_id > vocab_size:
-                    mask = mask.at[..., vocab_size:].add(float("-inf"))
-                # Re-allow control tokens
-                for allow_id in (pad_id, epad_id, sil_id):
-                    if allow_id < max_token_id:
-                        mask = mask.at[..., allow_id].add(float("inf"))
-                # Block structural tokens within vocab range
+                mask_np[:vocab_size] = 0.0
+                if 0 <= pad_id < V:
+                    mask_np[pad_id] = 0.0
+                if 0 <= epad_id < V:
+                    mask_np[epad_id] = 0.0
+                if 0 <= sil_id < V:
+                    mask_np[sil_id] = 0.0
+                # Block structural tokens
                 for block_id in BLOCKED_STRUCTURAL:
-                    if block_id < max_token_id:
-                        mask = mask.at[..., block_id].add(float("-inf"))
-                return user_logits + mask
+                    if 0 <= block_id < V:
+                        mask_np[block_id] = -np.inf
 
             else:
                 # PAD frame: PAD + EPAD + SIL allowed
-                _allow(pad_id)
-                _allow(epad_id)
-                _allow(sil_id)
+                if 0 <= pad_id < V:
+                    mask_np[pad_id] = 0.0
+                if 0 <= epad_id < V:
+                    mask_np[epad_id] = 0.0
+                if 0 <= sil_id < V:
+                    mask_np[sil_id] = 0.0
 
+        # Broadcast to match user_logits shape and add
+        mask = mx.array(mask_np)
         return user_logits + mask
 
     def _extract_context_token(self, state: DuplexMachineState) -> int | None:

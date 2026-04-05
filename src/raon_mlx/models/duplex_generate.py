@@ -16,6 +16,7 @@ import numpy as np
 from .raon import RaonMLX
 from .generate import sample_token, generate_audio_codes, _get_audio_output_embed
 from ..modules.kv_cache import KVCache, create_additive_causal_mask
+from ..utils.streaming_encoder import StreamingAudioEncoder
 from ..utils.special_tokens import (
     AUDIO_INPUT_PLACEHOLDER,
     AUDIO_OUTPUT_END_PAD,
@@ -64,6 +65,7 @@ class DuplexDecodingState:
     forced_sil_remaining: int = 0
     last_sequence_len: int = 0
     prev_audio_feedback: mx.array | None = None  # [1, 1, 4096]
+    streaming_encoder: StreamingAudioEncoder | None = field(default=None, repr=False)
     _silence_codes: mx.array | None = field(default=None, repr=False)
 
 
@@ -74,27 +76,30 @@ def _get_silence_codes(model: RaonMLX) -> mx.array:
     return codes[0, :NUM_CODE_GROUPS, 0]  # [16]
 
 
-def _encode_user_audio(model: RaonMLX, pcm: mx.array) -> mx.array:
-    """Encode one frame of user audio to thinker embedding space via Mimi.
+def _encode_user_audio(
+    encoder: StreamingAudioEncoder,
+    pcm: mx.array,
+) -> mx.array:
+    """Encode one frame of user audio to thinker embedding space.
+
+    Uses the PyTorch streaming encoder (Voxtral/AuT) with input adaptor.
 
     Args:
-        model: RaonMLX model with Mimi codec.
+        encoder: Streaming audio encoder (PyTorch on MPS).
         pcm: Raw PCM audio [1, 1, 1920].
 
     Returns:
-        Thinker-space embedding [1, 1, 4096].
+        Thinker-space embedding [1, num_frames, 4096].
+        num_frames is typically 1 but may be 0 if buffering.
     """
-    codes = model.mimi.encode_step(pcm)  # [1, codebooks, 1]
-    codes_16 = codes[:, :NUM_CODE_GROUPS, :]  # [1, 16, 1]
-    latent = model.mimi.quantizer.decode(codes_16)  # [1, 512, 1]
-    latent = latent.transpose(0, 2, 1)  # [1, 1, 512]
-    return model.output_adaptor(latent)  # [1, 1, 4096]
+    return encoder.encode_frame(pcm)
 
 
 def init_duplex_state(
     model: RaonMLX,
     tokenizer,
     *,
+    hf_model_path: str,
     system_prompt: str = "You are engaging in real-time conversation.",
     speak_first: bool = False,
     temperature: float = 0.9,
@@ -118,6 +123,11 @@ def init_duplex_state(
         use_backchannel_token=False,
     )
     state_manager = DuplexStateManager(state_config)
+
+    # Initialize PyTorch streaming audio encoder
+    from ..utils.streaming_encoder import get_streaming_encoder
+    streaming_encoder = get_streaming_encoder(hf_model_path)
+    streaming_encoder.reset()
 
     # Tokenize system prompt
     messages = [{"role": "system", "content": system_prompt}]
@@ -186,6 +196,26 @@ def init_duplex_state(
         talker_cache=talker_cache,
     )
 
+    # Run the newly appended frame tokens through the thinker to update KV cache.
+    # The prefill covered the system prompt + [IM_START, AUDIO_START].
+    # _update_duplex_sequences appended frame tokens (e.g. [AIP, SIL/text, AOP])
+    # to sequences but didn't run them through the thinker. We need the cache
+    # to include these so the next duplex_step's attention is correctly aligned.
+    num_new_tokens = new_sequences.shape[1] - sequences.shape[1]
+    if num_new_tokens > 0:
+        new_token_ids = new_sequences[:, -num_new_tokens:]
+        new_embeds = model.thinker.embed_tokens(new_token_ids)
+        # If audio output was generated, replace AOP position with feedback embedding
+        if new_machine_state.emitted_audio and new_audio_codes.shape[1] > 0:
+            last_codes = new_audio_codes[:, -1, :]
+            feedback_embed = _get_audio_output_embed(model, last_codes)
+            # AOP is the last token in the frame
+            new_embeds = mx.concatenate([
+                new_embeds[:, :-1, :],
+                feedback_embed,
+            ], axis=1)
+        model.thinker(inputs_embeds=new_embeds, cache=thinker_cache)
+
     # Reset Mimi streaming state
     model.mimi.reset_all()
     silence_codes = _get_silence_codes(model)
@@ -228,6 +258,7 @@ def init_duplex_state(
         forced_sil_remaining=forced_sil_remaining,
         last_sequence_len=new_sequences.shape[1],
         prev_audio_feedback=prev_audio_feedback,
+        streaming_encoder=streaming_encoder,
         _silence_codes=silence_codes,
     )
 
@@ -249,8 +280,18 @@ def duplex_step(
         output_audio: [1, 1, 1920] float32.
         new_text_token_ids: List of new text token IDs (empty if none).
     """
-    # 1. Encode user audio via Mimi streaming encoder
-    audio_input_embeds = _encode_user_audio(model, audio_input)
+    # 1. Encode user audio via PyTorch streaming encoder
+    assert state.streaming_encoder is not None, "streaming_encoder required for duplex"
+    audio_input_embeds = _encode_user_audio(state.streaming_encoder, audio_input)
+    # audio_input_embeds: [1, num_frames, 4096] — may be 0 frames if encoder is buffering
+
+    # If encoder produced 0 frames (buffering mel), use a zero embedding
+    if audio_input_embeds.shape[1] == 0:
+        audio_input_embeds = mx.zeros((1, 1, 4096))
+
+    # Use only the last frame if multiple were produced
+    if audio_input_embeds.shape[1] > 1:
+        audio_input_embeds = audio_input_embeds[:, -1:, :]
 
     # 2. Build thinker input from last frame tokens
     num_input_tokens = state.machine_state.num_input_tokens
@@ -372,6 +413,7 @@ def duplex_step(
         forced_sil_remaining=max(0, state.forced_sil_remaining - 1),
         last_sequence_len=new_sequences.shape[1],
         prev_audio_feedback=prev_audio_feedback,
+        streaming_encoder=state.streaming_encoder,
         _silence_codes=state._silence_codes,
     )
 
@@ -491,6 +533,7 @@ def run_duplex_offline(
     audio_path: str,
     output_dir: str,
     *,
+    hf_model_path: str,
     system_prompt: str = "You are engaging in real-time conversation.",
     speak_first: bool = False,
     temperature: float = 0.9,
@@ -529,6 +572,7 @@ def run_duplex_offline(
     logger.info("Initializing duplex state...")
     state = init_duplex_state(
         model, tokenizer,
+        hf_model_path=hf_model_path,
         system_prompt=system_prompt,
         speak_first=speak_first,
         temperature=temperature,

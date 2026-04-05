@@ -310,6 +310,7 @@ class RaonMLXPipeline:
             tokenizer=self.processor.tokenizer,
             audio_path=audio_input,
             output_dir=output_dir,
+            hf_model_path=self.hf_model_path,
             system_prompt=system_prompt,
             speak_first=speak_first,
             temperature=temperature,
