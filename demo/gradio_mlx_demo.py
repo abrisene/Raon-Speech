@@ -72,6 +72,16 @@ def run_inference(
             answer = pipe.speech_chat(path)
             return answer, None
 
+        elif task == "VoiceChat":
+            if audio is None:
+                return "VoiceChat requires audio input.", None
+            path = audio_to_tempfile(audio)
+            speaker_path = audio_to_tempfile(ref_audio)
+            seed = int(voice_seed) if voice_seed >= 0 else None
+            text, audio_out, sr = pipe.voice_chat(path, speaker_audio=speaker_path, seed=seed)
+            gradio_audio = (sr, audio_out) if audio_out is not None else None
+            return text, gradio_audio
+
         elif task == "TextQA":
             if not text.strip():
                 return "TextQA requires text input.", None
@@ -98,7 +108,7 @@ def build_interface(pipe: RaonMLXPipeline) -> gr.Blocks:
 
         with gr.Row():
             task = gr.Dropdown(
-                choices=["TTS", "STT", "SpeechChat", "TextQA"],
+                choices=["TTS", "STT", "SpeechChat", "VoiceChat", "TextQA"],
                 value="TTS",
                 label="Task",
             )
@@ -117,11 +127,11 @@ def build_interface(pipe: RaonMLXPipeline) -> gr.Blocks:
 
         def on_task_change(t):
             show_text_in = t in ("TTS", "TextQA")
-            show_audio_in = t in ("STT", "TextQA", "SpeechChat")
-            show_ref = t == "TTS"
-            show_seed = t == "TTS"
-            show_text_out = t != "TTS"
-            show_audio_out = t == "TTS"
+            show_audio_in = t in ("STT", "TextQA", "SpeechChat", "VoiceChat")
+            show_ref = t in ("TTS", "VoiceChat")
+            show_seed = t in ("TTS", "VoiceChat")
+            show_text_out = t not in ("TTS",)
+            show_audio_out = t in ("TTS", "VoiceChat")
             return (
                 gr.update(visible=show_text_in),
                 gr.update(visible=show_audio_in),

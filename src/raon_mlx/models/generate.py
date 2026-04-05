@@ -244,6 +244,159 @@ def stt_generate(
     return generated_ids
 
 
+def voice_chat_generate(
+    model: RaonMLX,
+    input_ids: mx.array,
+    audio_embeds: mx.array,
+    audio_embeds_mask: mx.array,
+    max_new_tokens: int = 512,
+    text_temperature: float = 0.7,
+    audio_temperature: float = 1.2,
+    top_k: int = 20,
+    top_p: float = 0.8,
+    speaker_embedding: mx.array | None = None,
+) -> tuple[str, mx.array, int]:
+    """Voice chat: audio in → text + audio out.
+
+    The model first generates a text response conditioned on the audio input,
+    then when it emits AUDIO_START, switches to audio generation mode.
+
+    Args:
+        model: Full RaonMLX model.
+        input_ids: Tokenized prompt with audio placeholders. Shape: [1, seq_len].
+        audio_embeds: Encoded audio embeddings. Shape: [1, num_frames, 4096].
+        audio_embeds_mask: Valid frame mask. Shape: [1, num_frames].
+        max_new_tokens: Maximum generation tokens.
+        text_temperature: Temperature for text generation.
+        audio_temperature: Temperature for audio code generation.
+        top_k: Top-k filtering.
+        top_p: Top-p nucleus sampling.
+        speaker_embedding: Optional speaker conditioning [1, 1, 4096].
+
+    Returns:
+        Tuple of (text_response, audio_waveform, sample_rate).
+        text_response: The model's text response.
+        audio_waveform: Shape [1, num_samples] or empty if text-only response.
+    """
+    import numpy as np
+
+    AUDIO_INPUT_PLACEHOLDER = 151676
+    codebook_size = 2048
+
+    # Build input embeddings with audio injection
+    inputs_embeds = model.thinker.embed_tokens(input_ids)
+    orig_dtype = inputs_embeds.dtype
+
+    input_ids_list = input_ids[0].tolist()
+    first_ph = None
+    last_ph = None
+    for i, tid in enumerate(input_ids_list):
+        if tid == AUDIO_INPUT_PLACEHOLDER:
+            if first_ph is None:
+                first_ph = i
+            last_ph = i
+
+    if first_ph is not None and audio_embeds.shape[1] > 0:
+        n_placeholders = last_ph - first_ph + 1
+        n_audio = audio_embeds.shape[1]
+        n_replace = min(n_placeholders, n_audio)
+        audio_embeds_cast = audio_embeds[:, :n_replace].astype(orig_dtype)
+        before = inputs_embeds[:, :first_ph, :]
+        after = inputs_embeds[:, first_ph + n_replace:, :]
+        inputs_embeds = mx.concatenate([before, audio_embeds_cast, after], axis=1)
+
+    # Inject speaker embedding if provided
+    if speaker_embedding is not None:
+        speaker_token_id = 151671
+        for i, tid in enumerate(input_ids_list):
+            if tid == speaker_token_id:
+                spk = speaker_embedding[:, 0, :].astype(orig_dtype)
+                # Build replacement via concatenation
+                before = inputs_embeds[:, :i, :]
+                after = inputs_embeds[:, i + 1:, :]
+                inputs_embeds = mx.concatenate([before, spk[:, None, :], after], axis=1)
+                break
+
+    # Create caches
+    thinker_cache = model.thinker.make_cache()
+    talker_cache = model.talker.make_cache()
+
+    # Prefill
+    thinker_normed, thinker_pre_norm = model.thinker(inputs_embeds=inputs_embeds, cache=thinker_cache)
+
+    # Start in text mode
+    text_logits = model.lm_head(thinker_normed)
+    generated_text_ids: list[int] = []
+    audio_codes_list: list[mx.array] = []
+    is_generating_audio = False
+
+    for step in range(max_new_tokens):
+        if is_generating_audio:
+            # Audio generation mode
+            talker_input = model.thinker_to_talker_proj(thinker_pre_norm)
+            talker_out = model.talker(talker_input, cache=talker_cache)
+
+            suppress = len(audio_codes_list) < 5
+            codes = generate_audio_codes(model, talker_out, temperature=audio_temperature,
+                                         top_k=top_k, suppress_eos=suppress)
+            audio_end = (codes[:, 0] == codebook_size).item()
+
+            if audio_end:
+                break
+            audio_codes_list.append(codes)
+
+            # Feed back audio codes
+            audio_embed = _get_audio_output_embed(model, codes)
+            thinker_normed, thinker_pre_norm = model.thinker(inputs_embeds=audio_embed, cache=thinker_cache)
+        else:
+            # Text generation mode
+            next_logits = text_logits[:, -1]
+            # Don't suppress audio tokens — let the model decide when to speak
+            if text_temperature > 0:
+                next_token = sample_token(next_logits, temperature=text_temperature, top_k=top_k, top_p=top_p)
+            else:
+                next_token = next_logits.argmax(axis=-1, keepdims=True)
+
+            token_id = next_token[0, 0].item()
+
+            if token_id == IM_END:
+                break
+            elif token_id == AUDIO_START:
+                # Switch to audio mode
+                is_generating_audio = True
+                # Run the AUDIO_START token through thinker
+                thinker_normed, thinker_pre_norm = model.thinker(input_ids=next_token, cache=thinker_cache)
+                # Initialize talker cache with prefill
+                talker_input = model.thinker_to_talker_proj(thinker_pre_norm)
+                talker_out = model.talker(talker_input, cache=talker_cache)
+                # Generate first audio frame
+                first_codes = generate_audio_codes(model, talker_out[:, -1:], temperature=audio_temperature,
+                                                    top_k=top_k, suppress_eos=True)
+                audio_codes_list.append(first_codes)
+                # Feed back
+                audio_embed = _get_audio_output_embed(model, first_codes)
+                thinker_normed, thinker_pre_norm = model.thinker(inputs_embeds=audio_embed, cache=thinker_cache)
+                continue
+            else:
+                generated_text_ids.append(token_id)
+                thinker_normed, thinker_pre_norm = model.thinker(input_ids=next_token, cache=thinker_cache)
+                text_logits = model.lm_head(thinker_normed)
+
+    # Decode text
+    text_response = ""  # Will be decoded by caller with tokenizer
+
+    # Decode audio
+    if audio_codes_list:
+        all_codes = mx.stack(audio_codes_list, axis=1)
+        all_codes = all_codes.transpose(0, 2, 1)
+        pcm = model.mimi.decode(all_codes)
+        pcm = pcm[:, 0]
+    else:
+        pcm = mx.zeros((1, 0))
+
+    return generated_text_ids, pcm, 24000
+
+
 def _get_audio_output_embed(model: RaonMLX, codes: mx.array) -> mx.array:
     """Convert generated audio codes to thinker input embeddings.
 
