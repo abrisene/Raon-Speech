@@ -151,10 +151,16 @@ class _CodePredictorTransformer(nn.Module):
 
     def __call__(
         self,
-        xs: mx.array,
+        input_ids: mx.array | None = None,
+        inputs_embeds: mx.array | None = None,
         cache: list[KVCache] | None = None,
         mask: mx.array | None = None,
     ) -> mx.array:
+        if inputs_embeds is not None:
+            xs = inputs_embeds
+        else:
+            raise ValueError("_CodePredictorTransformer requires inputs_embeds")
+
         if mask is None and xs.shape[1] > 1:
             offset = cache[0].offset if cache is not None else 0
             mask = create_additive_causal_mask(xs.shape[1], offset)
