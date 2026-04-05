@@ -24,8 +24,9 @@ class RealtimeRuntimeManager:
 
     _MAX_COMPLETED_SESSIONS = 256
 
-    def __init__(self, *, model_path: str, session_kwargs: dict[str, Any] | None = None) -> None:
+    def __init__(self, *, model_path: str, hf_model_path: str | None = None, session_kwargs: dict[str, Any] | None = None) -> None:
         self.model_path = model_path
+        self.hf_model_path = hf_model_path
         self.session_kwargs = dict(session_kwargs or {})
         self._active_session: Any | None = None
         self._active_session_id: str | None = None
@@ -49,6 +50,7 @@ class RealtimeRuntimeManager:
         try:
             get_mlx_runtime(
                 model_path=self.model_path,
+                hf_model_path=self.hf_model_path,
                 quantize=str(self.session_kwargs.get("quantize", "hybrid")),
             )
             logger.info("MLX runtime preload complete model_path=%s", self.model_path)
@@ -65,6 +67,7 @@ class RealtimeRuntimeManager:
             kwargs.update(query or {})
             kwargs.setdefault("session_id", session_id)
             kwargs.setdefault("model_path", self.model_path)
+            kwargs.setdefault("hf_model_path", self.hf_model_path)
             session = create_session(**kwargs)
             self._active_session = session
             self._active_session_id = session_id
@@ -166,13 +169,13 @@ _singleton_lock = threading.Lock()
 _singleton_manager: RealtimeRuntimeManager | None = None
 
 
-def get_runtime_manager(*, model_path: str, session_kwargs: dict[str, Any] | None = None) -> RealtimeRuntimeManager:
+def get_runtime_manager(*, model_path: str, hf_model_path: str | None = None, session_kwargs: dict[str, Any] | None = None) -> RealtimeRuntimeManager:
     global _singleton_manager
     if _singleton_manager is not None:
         return _singleton_manager
     with _singleton_lock:
         if _singleton_manager is None:
-            _singleton_manager = RealtimeRuntimeManager(model_path=model_path, session_kwargs=session_kwargs)
+            _singleton_manager = RealtimeRuntimeManager(model_path=model_path, hf_model_path=hf_model_path, session_kwargs=session_kwargs)
         return _singleton_manager
 
 
@@ -238,11 +241,12 @@ def mount_realtime_websocket(app: FastAPI, manager: RealtimeRuntimeManager, *, p
 def create_fastapi_app(
     *,
     model_path: str,
+    hf_model_path: str | None = None,
     session_kwargs: dict[str, Any] | None = None,
     ws_path: str = "/realtime/ws",
 ) -> FastAPI:
     app = FastAPI(title="RAON MLX Realtime Duplex")
-    manager = get_runtime_manager(model_path=model_path, session_kwargs=session_kwargs)
+    manager = get_runtime_manager(model_path=model_path, hf_model_path=hf_model_path, session_kwargs=session_kwargs)
     mount_realtime_websocket(app, manager, path=ws_path)
 
     @app.on_event("startup")

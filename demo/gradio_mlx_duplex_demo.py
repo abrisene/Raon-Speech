@@ -299,6 +299,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-path", type=str, default=DEFAULT_MODEL_PATH)
     parser.add_argument("--result-root", type=str, default=DEFAULT_RESULT_ROOT)
     parser.add_argument("--speaker-audio", type=str, default="")
+    parser.add_argument("--hf-model-path", type=str, default=None,
+                        help="HF checkpoint path for tokenizer/encoder (if different from --model-path)")
     parser.add_argument("--quantize", type=str, default="hybrid",
                         choices=["hybrid", "8bit", "4bit", "none"])
     return parser.parse_args()
@@ -316,6 +318,7 @@ def main() -> None:
     )
     fastapi_app = create_fastapi_app(
         model_path=args.model_path,
+        hf_model_path=args.hf_model_path,
         session_kwargs={
             "result_root": args.result_root,
             "quantize": args.quantize,

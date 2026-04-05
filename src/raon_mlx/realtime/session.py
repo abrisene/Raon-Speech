@@ -85,6 +85,7 @@ class MLXRealtimeDuplexSession:
         *,
         session_id: str,
         model_path: str,
+        hf_model_path: str | None = None,
         result_root: str = "./output/mlx_duplex_demo",
         session: dict[str, Any] | None = None,
         runtime: dict[str, Any] | None = None,
@@ -93,6 +94,19 @@ class MLXRealtimeDuplexSession:
         session_payload = dict(session or {})
         sampling_payload = dict(session_payload.get("sampling") or {})
         audio_payload = dict(session_payload.get("audio") or {})
+
+        # Resolve HF model path for tokenizer + encoder
+        # If model_path is an MLX converted dir, read source_model from config
+        if hf_model_path is None:
+            import json as _json
+            cfg_path = Path(model_path) / "config.json"
+            if cfg_path.exists():
+                with open(cfg_path) as _f:
+                    _cfg = _json.load(_f)
+                hf_model_path = _cfg.get("source_model") or model_path
+            else:
+                hf_model_path = model_path
+        self._hf_model_path = hf_model_path
 
         self._config = SessionConfig(
             session_id=session_id,
@@ -116,6 +130,7 @@ class MLXRealtimeDuplexSession:
         # Load MLX model
         model, tokenizer = get_mlx_runtime(
             model_path=model_path,
+            hf_model_path=self._hf_model_path,
             quantize=str((runtime or {}).get("quantize", "hybrid")),
         )
         self._model = model
@@ -137,6 +152,7 @@ class MLXRealtimeDuplexSession:
         self._duplex_state = init_duplex_state(
             model=model,
             tokenizer=tokenizer,
+            hf_model_path=self._hf_model_path,
             system_prompt=self._config.prompt,
             speak_first=self._config.speak_first,
             temperature=self._config.sampling.temperature,
@@ -378,6 +394,7 @@ _RUNTIME_CACHE: dict[str, tuple] = {}
 def get_mlx_runtime(
     *,
     model_path: str,
+    hf_model_path: str | None = None,
     quantize: str = "hybrid",
 ) -> tuple:
     """Return (model, tokenizer) singleton for the given model path."""
@@ -421,9 +438,11 @@ def get_mlx_runtime(
     elif quantize == "4bit":
         nn.quantize(model.thinker, bits=4, group_size=64)
 
-    # Load tokenizer
+    # Load tokenizer — try HF model path first (has tokenizer files),
+    # fall back to model_path if not specified
     from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=False)
+    tokenizer_path = hf_model_path or model_path
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=False)
 
     # Warmup Mimi
     model.mimi.reset_all()
