@@ -357,17 +357,20 @@ Tried and reverted:
   win for code clarity but no measurable perf change, because the bottleneck
   is the sequential code-predictor loop, not the cache machinery.
 
-### Code-cleanliness opportunity (no perf change)
+### Cleanup tried, reverted (worth knowing for future maintainers)
 
-`omlx` (the production MLX serving framework next door) and `mlx_lm` use a
-much simpler `KVCache` than ours — sequential append only, no `cache_position`
-parameter, no per-position Python loop. Our `cache_position` support exists
-purely because of the historical init-second-pass that pre-filled positions
-the first duplex frame would then rewrite. With that pre-fill gone (verified
-to still produce correct audio), `cache_position` could be removed entirely
-and we could swap our `src/raon_mlx/modules/kv_cache.py` for
-`mlx_lm.models.cache.KVCache`. Worth doing during the next quant or
-quant-cache refactor.
+We attempted to align with `omlx` / `mlx_lm`'s simpler cache pattern: drop
+`cache_position`, drop the init second-pass forward, let the first duplex
+frame just append. The audio still rendered correctly, but **steady-state
+per-frame time regressed by ~14 ms** on the offline test (and the first
+frame jumped to ~3 s). Our best guess: MLX's lazy graph compiles a
+different (worse) plan when positions are inferred from `cache.offset`
+rather than passed in explicitly, possibly because the offset read forces
+a small synchronization that the explicit-position path avoids.
+
+If a future MLX version improves graph compilation or we move to a single
+`mx.compile`d step function, this regression should disappear and the
+cleanup is worth revisiting.
 
 ## Open Questions
 
