@@ -154,8 +154,17 @@ def generate_audio_codes(
     code_embed = model.code_predictor.codec_embedding(safe_first_code)  # [B, 1, 1024]
     inputs_embeds = mx.concatenate([hidden_embed, code_embed], axis=1)  # [B, 2, 1024]
 
-    # Autoregressive code prediction for remaining 15 codebooks
-    cp_cache = model.code_predictor.make_cache()
+    # Autoregressive code prediction for remaining 15 codebooks.
+    # Reuse a persistent code-predictor cache across calls — the cache is small
+    # (~17 positions max), and re-allocating its tensors every duplex frame was
+    # measurable overhead in the offline run. Just reset offsets between calls.
+    cp_cache = getattr(model.code_predictor, "_persistent_cache", None)
+    if cp_cache is None:
+        cp_cache = model.code_predictor.make_cache()
+        model.code_predictor._persistent_cache = cp_cache
+    else:
+        for c in cp_cache:
+            c.offset = 0
 
     # Prefill with the 2-token input
     cp_out = model.code_predictor.model(inputs_embeds=inputs_embeds, cache=cp_cache)  # [B, 2, 1024]
