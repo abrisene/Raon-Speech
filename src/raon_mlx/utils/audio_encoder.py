@@ -62,19 +62,32 @@ def encode_audio_tensor(
         input_adaptor_post_norm_weight: RMSNorm weight [4096].
 
     Returns:
-        Tuple of (audio_embeds [1, frames, 4096], mask [1, frames]).
+        Tuple of (audio_embeds [1, total_frames, 4096], mask [1, total_frames]).
+        If the processor chunked a long utterance into multiple batch rows, the
+        per-row encoder outputs are concatenated back into a single temporal
+        sequence for STT generation.
     """
     import torch
 
     if audio_tensor.ndim == 2:
-        audio_tensor = audio_tensor.unsqueeze(1)  # [1, samples] -> [1, 1, samples]
+        audio_tensor = audio_tensor.unsqueeze(1)  # [B, samples] -> [B, 1, samples]
 
     encoder = _get_audio_encoder(model_path)
     with torch.no_grad():
         output = encoder(audio=audio_tensor.float(), audio_lengths=audio_lengths)
         embeds = output.embeds  # [1, num_frames, 2048]
+    embeds_np = embeds.cpu().float().numpy()
 
-    embeds_mx = mx.array(embeds.cpu().float().numpy())
+    # The processor may chunk a long utterance into multiple rows. Collapse the
+    # batch back into one continuous sequence of frame embeddings.
+    if embeds_np.ndim != 3:
+        raise ValueError(f"Expected encoder embeds to be rank-3, got shape {embeds_np.shape}")
+    if embeds_np.shape[0] == 1:
+        merged_np = embeds_np
+    else:
+        merged_np = embeds_np.reshape(1, embeds_np.shape[0] * embeds_np.shape[1], embeds_np.shape[2])
+
+    embeds_mx = mx.array(merged_np)
     mask_mx = mx.ones((1, embeds_mx.shape[1]), dtype=mx.bool_)
 
     # Input adaptor: 2-layer MLP (GELU) + RMSNorm
@@ -98,8 +111,10 @@ def _get_audio_encoder(model_path: str):
     from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
         Qwen3OmniMoeAudioEncoderConfig,
     )
+    from transformers.models.voxtral_realtime.configuration_voxtral_realtime import VoxtralRealtimeEncoderConfig
 
     from raon.modules.audio_encoder import AuTWrapper
+    from raon.modules.voxtral_wrapper import VoxtralWrapper
     from raon.utils.misc import load_safetensors_by_prefix
 
     # Load config
@@ -108,18 +123,39 @@ def _get_audio_encoder(model_path: str):
     with open(Path(model_path) / "config.json") as f:
         cfg = json.load(f)
 
-    ae_config = Qwen3OmniMoeAudioEncoderConfig(**cfg["audio_encoder_config"])
-    encoder = AuTWrapper.from_config(ae_config, dtype=torch.float32)
+    ae_cfg = cfg["audio_encoder_config"]
+    model_type = ae_cfg.get("model_type", "")
 
-    # Load weights from checkpoint.
-    # The HF keys are audio_encoder.encoder.*, which after prefix stripping become
-    # encoder.*. The AuTEncoder expects keys without the encoder. prefix.
-    state_dicts = load_safetensors_by_prefix(
-        model_path,
-        prefixes={"audio_encoder": "audio_encoder.encoder."},
-        dtype=torch.float32,
-    )
-    encoder.encoder.load_state_dict(state_dicts["audio_encoder"], strict=False)
+    if "voxtral" in model_type:
+        vox_cfg = VoxtralRealtimeEncoderConfig(**ae_cfg)
+        if not hasattr(vox_cfg, "rope_theta") or getattr(vox_cfg, "rope_theta", None) is None:
+            vox_cfg.rope_theta = ae_cfg.get("rope_theta", 1000000.0)
+        encoder = VoxtralWrapper.from_config(vox_cfg, dtype=torch.float32)
+
+        state_dicts = load_safetensors_by_prefix(
+            model_path,
+            prefixes={"audio_encoder": "audio_encoder.encoder."},
+            dtype=torch.float32,
+        )
+        enc_weights = state_dicts["audio_encoder"]
+        result = encoder.encoder.load_state_dict(enc_weights, strict=False)
+        if result.missing_keys:
+            logger = __import__("logging").getLogger(__name__)
+            logger.warning("Voxtral encoder missing keys: %s", result.missing_keys[:5])
+    else:
+        ae_config = Qwen3OmniMoeAudioEncoderConfig(**ae_cfg)
+        encoder = AuTWrapper.from_config(ae_config, dtype=torch.float32)
+
+        # Load weights from checkpoint.
+        # The HF keys are audio_encoder.encoder.*, which after prefix stripping become
+        # encoder.*. The AuTEncoder expects keys without the encoder. prefix.
+        state_dicts = load_safetensors_by_prefix(
+            model_path,
+            prefixes={"audio_encoder": "audio_encoder.encoder."},
+            dtype=torch.float32,
+        )
+        encoder.encoder.load_state_dict(state_dicts["audio_encoder"], strict=False)
+
     encoder.requires_grad_(False)
 
     _audio_encoder_cache = encoder

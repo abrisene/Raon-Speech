@@ -107,6 +107,8 @@ def start_session(
     speaker_audio: str,
     system_prompt: str,
     speak_first: bool,
+    persona: str,
+    persona_context: str,
     temperature: float,
     top_k: int,
     top_p: float,
@@ -121,6 +123,7 @@ def start_session(
         "result_root": result_root,
         "session": {
             "prompt": system_prompt,
+            "prompt_role": "system",
             "speak_first": bool(speak_first),
             "sampling": {
                 "temperature": float(temperature),
@@ -140,6 +143,12 @@ def start_session(
     speaker_audio_str = speaker_audio.strip() if speaker_audio else ""
     if speaker_audio_str:
         payload["session"]["speaker_audio"] = speaker_audio_str
+    persona_str = persona.strip() if persona else ""
+    context_str = persona_context.strip() if persona_context else ""
+    if persona_str:
+        payload["session"]["persona"] = persona_str
+    if context_str:
+        payload["session"]["persona_context"] = context_str
 
     try:
         data = _call_first(
@@ -205,16 +214,48 @@ def build_interface(
                 value="listen-first",
             )
             system_prompt = gr.Textbox(
-                label="System Prompt",
-                value="You are engaging in real-time conversation.",
-                visible=True,
+                label="System Prompt / Key",
+                value="eng:full_duplex:listen-first",
+                visible=False,
             )
             speak_first = gr.Checkbox(label="Speak First", value=False, visible=False)
 
-            def _sync_mode(mode: str) -> tuple[bool]:
-                return (mode == "speak-first",)
+            def _sync_mode(mode: str) -> tuple[str, bool]:
+                if mode == "speak-first":
+                    return "eng:full_duplex:speak-first", True
+                return "eng:full_duplex:listen-first", False
 
-            mode_radio.change(fn=_sync_mode, inputs=[mode_radio], outputs=[speak_first])
+            mode_radio.change(fn=_sync_mode, inputs=[mode_radio], outputs=[system_prompt, speak_first])
+
+        with gr.Row():
+            persona = gr.Dropdown(
+                label="Persona",
+                choices=[
+                    "",
+                    "general",
+                    "game",
+                    "scenario_movie",
+                    "scenario_banking",
+                    "scenario_fitness",
+                    "scenario_shopping",
+                    "scenario_pet",
+                    "scenario_healthcare",
+                    "scenario_realestate",
+                    "scenario_techsupport",
+                    "scenario_carrental",
+                    "scenario_event",
+                    "scenario_restaurant",
+                    "scenario_language",
+                    "scenario_travel",
+                    "scenario_interview",
+                    "scenario_game_npc",
+                ],
+                value="",
+                allow_custom_value=True,
+            )
+            persona_context = gr.Textbox(
+                label="Persona Context (optional)", value="", placeholder="e.g. The user speaks English"
+            )
 
         with gr.Row():
             temperature = gr.Slider(label="Temperature", minimum=0.0, maximum=1.2, step=0.01, value=0.9)
@@ -226,7 +267,7 @@ def build_interface(
             sil_penalty = gr.Slider(label="Sil Penalty", minimum=0.0, maximum=2.0, step=0.01, value=0.0)
             bc_penalty = gr.Slider(label="BC Penalty", minimum=-2.0, maximum=2.0, step=0.01, value=0.0)
             mic_gain = gr.Slider(label="Mic Gain", minimum=0.0, maximum=2.0, step=0.05, value=1.0)
-            noise_gate = gr.Slider(label="Noise Gate (RMS)", minimum=0.0, maximum=0.1, step=0.001, value=0.03)
+            noise_gate = gr.Slider(label="Noise Gate (RMS)", minimum=0.0, maximum=0.1, step=0.001, value=0.0)
 
         with gr.Row():
             start_btn = gr.Button("Start", variant="primary", size="lg")
@@ -237,7 +278,7 @@ def build_interface(
             label="Live Transcript", value="", lines=14,
             interactive=False, autoscroll=True, elem_id="fd-transcript",
         )
-        session_id = gr.Textbox(label="Session ID", value="", interactive=False)
+        session_id = gr.Textbox(label="Session ID", value="", interactive=False, elem_id="fd-session-id")
 
         gr.Markdown("### Downloads")
         with gr.Row():
@@ -255,6 +296,7 @@ def build_interface(
             inputs=[
                 api_base, model_path_box, result_root_box, speaker_audio_box,
                 system_prompt, speak_first,
+                persona, persona_context,
                 temperature, top_k, top_p,
                 eos_penalty, sil_penalty, bc_penalty,
                 mic_gain, noise_gate,
@@ -301,7 +343,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--speaker-audio", type=str, default="")
     parser.add_argument("--hf-model-path", type=str, default=None,
                         help="HF checkpoint path for tokenizer/encoder (if different from --model-path)")
-    parser.add_argument("--quantize", type=str, default="hybrid",
+    parser.add_argument("--quantize", type=str, default="8bit",
                         choices=["hybrid", "8bit", "4bit", "none"])
     return parser.parse_args()
 

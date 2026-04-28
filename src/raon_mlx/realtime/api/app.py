@@ -51,7 +51,7 @@ class RealtimeRuntimeManager:
             get_mlx_runtime(
                 model_path=self.model_path,
                 hf_model_path=self.hf_model_path,
-                quantize=str(self.session_kwargs.get("quantize", "hybrid")),
+                quantize=str(self.session_kwargs.get("quantize", "8bit")),
             )
             logger.info("MLX runtime preload complete model_path=%s", self.model_path)
         except Exception:
@@ -107,6 +107,15 @@ class RealtimeRuntimeManager:
         return [Frame.ready()]
 
     async def on_audio(self, session: Any, pcm: Any) -> list[Frame]:
+        fn = getattr(session, "handle_audio_frame", None)
+        if callable(fn):
+            result = fn(pcm)
+            if isinstance(result, list):
+                return result
+        return []
+
+    def on_audio_sync(self, session: Any, pcm: Any) -> list[Frame]:
+        """Synchronous version of on_audio for use with asyncio.to_thread."""
         fn = getattr(session, "handle_audio_frame", None)
         if callable(fn):
             result = fn(pcm)
@@ -189,23 +198,27 @@ def mount_realtime_websocket(app: FastAPI, manager: RealtimeRuntimeManager, *, p
         try:
             session = manager.attach_session(session_id=session_id, query=query)
         except RuntimeError as exc:
+            logger.warning("WebSocket attach failed id=%s: %s", session_id, exc)
             await websocket.send_bytes(Frame.error("session already active").encode())
             await websocket.send_bytes(Frame.close(reason=str(exc) or "busy").encode())
             await websocket.close()
             return
 
-        logger.info("realtime session started id=%s", session_id)
+        logger.info("realtime session attached id=%s", session_id)
         close_reason = "client_disconnect"
         try:
             for frame in await manager.on_start(session):
                 await websocket.send_bytes(frame.encode())
+            logger.info("realtime session READY sent id=%s", session_id)
 
             while True:
                 raw = await websocket.receive_bytes()
                 incoming = Frame.decode(raw)
 
                 if incoming.kind == MessageKind.AUDIO:
-                    outgoing = await manager.on_audio(session, incoming.audio_samples())
+                    # Run blocking duplex_step in a thread to keep event loop alive
+                    pcm = incoming.audio_samples()
+                    outgoing = await asyncio.to_thread(manager.on_audio_sync, session, pcm)
                 elif incoming.kind == MessageKind.CLOSE:
                     close_reason = incoming.text_content() or "client_finish"
                     outgoing = await manager.on_close(session, close_reason)
@@ -251,7 +264,7 @@ def create_fastapi_app(
 
     @app.on_event("startup")
     async def _startup_preload_runtime() -> None:
-        manager.preload_runtime()
+        await asyncio.to_thread(manager.preload_runtime)
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
@@ -265,18 +278,26 @@ def create_fastapi_app(
     @app.post("/realtime/session/start")
     async def start_session(payload: dict[str, Any]) -> JSONResponse:
         force_restart = bool((payload or {}).get("force_restart", False))
+
+        def _do_reserve() -> str:
+            return manager.reserve_session(payload)
+
         try:
-            session_id = manager.reserve_session(payload)
+            session_id = await asyncio.to_thread(_do_reserve)
         except RuntimeError as exc:
             if force_restart:
                 with contextlib.suppress(Exception):
                     manager.force_finish_active_session(reason="force_restart")
                 try:
-                    session_id = manager.reserve_session(payload)
+                    session_id = await asyncio.to_thread(_do_reserve)
                 except RuntimeError as retry_exc:
                     raise HTTPException(status_code=409, detail=str(retry_exc)) from retry_exc
             else:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.exception("Session creation failed")
+            raise HTTPException(status_code=500, detail=f"Session creation failed: {exc}") from exc
+        logger.info("Session reserved: %s", session_id)
         return JSONResponse({"session_id": session_id, "ws_path": ws_path})
 
     @app.post("/realtime/session/finish")
