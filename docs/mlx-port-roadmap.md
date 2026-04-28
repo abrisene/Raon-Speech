@@ -341,11 +341,33 @@ Further optimization candidates (not yet tried):
 - `mx.compile` the per-step inner function. The mutable KV cache prevents the
   obvious wrapping; would need to thread cache state in/out as MLX arrays.
 - Drop the `audio_lm_head` EOS column (suppress_eos always sets it to -1e9)
-  to shrink the matmul from `[2049, 2048]` to `[2048, 2048]`. Trivial.
+  to shrink the matmul from `[2049, 2048]` to `[2048, 2048]`. Trivial in fp16,
+  needs a quantized-aware row slice for 8-bit weights.
 - Custom Metal kernel for the per-step transformer block, fused. Out of
   scope for now but the highest-ceiling option.
 - Pre-allocate KV caches at session start to avoid the 4-or-so reallocations
-  during a long conversation. Marginal.
+  during a long conversation. Tested at `step=2048`; cold-start cost
+  outweighed the steady-state win for this workload.
+
+Tried and reverted:
+- KV cache contiguous-write fast-path: replacing the per-position Python loop
+  with a single slice assignment was *slower*, presumably because MLX's lazy
+  graph prefers smaller writes that fuse with later ops.
+- Skipping the init second-pass forward (matching PT's flow exactly): clean
+  win for code clarity but no measurable perf change, because the bottleneck
+  is the sequential code-predictor loop, not the cache machinery.
+
+### Code-cleanliness opportunity (no perf change)
+
+`omlx` (the production MLX serving framework next door) and `mlx_lm` use a
+much simpler `KVCache` than ours — sequential append only, no `cache_position`
+parameter, no per-position Python loop. Our `cache_position` support exists
+purely because of the historical init-second-pass that pre-filled positions
+the first duplex frame would then rewrite. With that pre-fill gone (verified
+to still produce correct audio), `cache_position` could be removed entirely
+and we could swap our `src/raon_mlx/modules/kv_cache.py` for
+`mlx_lm.models.cache.KVCache`. Worth doing during the next quant or
+quant-cache refactor.
 
 ## Open Questions
 
