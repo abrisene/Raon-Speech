@@ -208,6 +208,11 @@ cython_debug/
 # OMC state
 .omc/
 
+# Other agent / IDE local state
+.claude/
+.cursor/
+.omx/
+
 # Ruff stuff:
 .ruff_cache/
 
