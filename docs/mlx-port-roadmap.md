@@ -312,6 +312,41 @@ The SpeechChat model adds simultaneous listen/speak capability:
 - Turn-taking and interruption handling
 - Requires the duplex model architecture (separate from base Speech model)
 
+## Duplex Performance Profile (8-bit, M-series)
+
+Per-section ms per frame, averaged over 30 frames after 5-frame warmup
+(`scripts/profile_duplex.py`):
+
+| Section                       | avg ms | notes                                       |
+|------------------------------|--------|---------------------------------------------|
+| 01 encode_user (Voxtral)     |   1.0  | streaming MLX encoder + input adaptor       |
+| 02 build_embeds              |   0.2  | embedding lookup + placeholder splice       |
+| 03 thinker (36L Qwen3, 8b)   |   1.6  | growing KV cache; small input (2-3 tokens)  |
+| 04 talker (4L Qwen3, 8b)     |   0.4  |                                             |
+| **05 update_seq + audio**    | **62.4** | **15 sequential code-predictor steps**      |
+| 06 mimi decode_step          |   0.5  |                                             |
+| **TOTAL**                    | **66.0** | RTF ~0.88 on 28.4 s test                    |
+
+**Section 05 dominates (95% of frame time).** Inside it, ~95% is the
+autoregressive code predictor: 15 sequential 5-layer transformer steps to
+predict codebooks 2–16 given codebook 1. The architecture is sequential by
+construction (each code conditions on the previous), so this can't be
+batched without retraining a parallel-prediction head.
+
+Already-applied optimizations:
+- Reuse the code-predictor KV cache across frames (was reallocating ~5680
+  cache slots per 28 s run). Net 13% speed-up.
+
+Further optimization candidates (not yet tried):
+- `mx.compile` the per-step inner function. The mutable KV cache prevents the
+  obvious wrapping; would need to thread cache state in/out as MLX arrays.
+- Drop the `audio_lm_head` EOS column (suppress_eos always sets it to -1e9)
+  to shrink the matmul from `[2049, 2048]` to `[2048, 2048]`. Trivial.
+- Custom Metal kernel for the per-step transformer block, fused. Out of
+  scope for now but the highest-ceiling option.
+- Pre-allocate KV caches at session start to avoid the 4-or-so reallocations
+  during a long conversation. Marginal.
+
 ## Open Questions
 
 1. **Mimi num_quantizers**: Raon uses 32 quantizers (1 semantic + 31 acoustic) but Moshi typically uses 8 or 16. PersonaPlex's VQ is parameterized, so this should work, but needs verification.
