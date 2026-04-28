@@ -116,7 +116,11 @@ class Talker(nn.Module):
     ) -> mx.array:
         if mask is None and xs.shape[1] > 1:
             if cache_position is not None:
-                offset = int(cache_position[0].item())
+                # Accept Python sequences to avoid a host sync per call.
+                if isinstance(cache_position, (list, tuple)):
+                    offset = int(cache_position[0])
+                else:
+                    offset = int(cache_position[0].item())
             else:
                 offset = cache[0].offset if cache is not None else 0
             mask = create_additive_causal_mask(xs.shape[1], offset)

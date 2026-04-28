@@ -314,63 +314,137 @@ The SpeechChat model adds simultaneous listen/speak capability:
 
 ## Duplex Performance Profile (8-bit, M-series)
 
-Per-section ms per frame, averaged over 30 frames after 5-frame warmup
-(`scripts/profile_duplex.py`):
+### Headline numbers (after 2026-04-28 perf pass)
+
+| Metric                  | Baseline (pre-pass) | Current  |
+|-------------------------|---------------------|----------|
+| Mean RTF (8 det. runs)  | ~0.88               | **0.78** |
+| Avg frame time          | ~70 ms              | **63.7 ms** |
+| Headroom under 80 ms    | ~10 ms              | **~16 ms (~20%)** |
+
+Bench harness: `scripts/bench_duplex.py` — fixed seed, 3-frame warmup,
+deterministic across runs (so the RTF is comparable; offline test RTF varies
+with the sampled response length).
+
+### Per-section profile (`scripts/profile_duplex.py`)
 
 | Section                       | avg ms | notes                                       |
 |------------------------------|--------|---------------------------------------------|
 | 01 encode_user (Voxtral)     |   1.0  | streaming MLX encoder + input adaptor       |
 | 02 build_embeds              |   0.2  | embedding lookup + placeholder splice       |
-| 03 thinker (36L Qwen3, 8b)   |   1.6  | growing KV cache; small input (2-3 tokens)  |
+| 03 thinker (36L Qwen3, 8b)   |   1.6  | *(misleading — see lazy-eval note below)*   |
 | 04 talker (4L Qwen3, 8b)     |   0.4  |                                             |
-| **05 update_seq + audio**    | **62.4** | **15 sequential code-predictor steps**      |
+| **05 update_seq + audio**    | **57.7** | **dominated by deferred thinker eval**    |
 | 06 mimi decode_step          |   0.5  |                                             |
-| **TOTAL**                    | **66.0** | RTF ~0.88 on 28.4 s test                    |
+| TOTAL                        |  61.5  | (sum of section avgs)                       |
 
-**Section 05 dominates (95% of frame time).** Inside it, ~95% is the
-autoregressive code predictor: 15 sequential 5-layer transformer steps to
-predict codebooks 2–16 given codebook 1. The architecture is sequential by
-construction (each code conditions on the previous), so this can't be
-batched without retraining a parallel-prediction head.
+**Important caveat:** `mx.synchronize()` does **not** trigger evaluation of
+lazy MLX graphs — it only waits for already-queued GPU work. The per-section
+mx.synchronize bracketing in `profile_duplex.py` therefore mis-attributes the
+thinker forward to whichever section first calls `.item()` (in our flow,
+`predicted_token[0,0].item()` inside section 05).
 
-Already-applied optimizations:
-- Reuse the code-predictor KV cache across frames (was reallocating ~5680
-  cache slots per 28 s run). Net 13% speed-up.
+When we force evaluation at end of section 03 (an explicit `mx.eval` on
+`text_logits` and `thinker_pre_norm`), the breakdown shifts to its real shape:
 
-Further optimization candidates (not yet tried):
-- `mx.compile` the per-step inner function. The mutable KV cache prevents the
-  obvious wrapping; would need to thread cache state in/out as MLX arrays.
-- Drop the `audio_lm_head` EOS column (suppress_eos always sets it to -1e9)
-  to shrink the matmul from `[2049, 2048]` to `[2048, 2048]`. Trivial in fp16,
-  needs a quantized-aware row slice for 8-bit weights.
-- Custom Metal kernel for the per-step transformer block, fused. Out of
-  scope for now but the highest-ceiling option.
-- Pre-allocate KV caches at session start to avoid the 4-or-so reallocations
-  during a long conversation. Tested at `step=2048`; cold-start cost
-  outweighed the steady-state win for this workload.
+| Section                              | avg ms |
+|--------------------------------------|--------|
+| 03 thinker forward + lm_head (real)  |  ~27   |
+| 04 talker forward                    |   0.5  |
+| 05 sample + (cond) audio codes       |  ~5    |
+| 06 mimi decode_step                  |   0.5  |
+| 01-02 encode + build embeds          |   1.2  |
+| Other (Python overhead, state ops)   |  ~30   |
 
-Tried and reverted:
+The 36-layer thinker forward + lm_head is the real per-frame bottleneck, not
+the code predictor (which is only ~3.6 ms when called).
+
+### Optimizations applied this pass
+
+| Lever | File | Effect |
+|---|---|---|
+| `mx.fast.rope` for sequential offsets | `models/qwen3.py` | Fused Metal kernel; precomputed `inv_freq` for the `position_ids` fallback |
+| Drop `mx.repeat` for GQA — `sdpa` natively supports it | `models/qwen3.py` | Removes 2 ops × 5 layers × 14 steps in code predictor |
+| Fused `_swiglu` via `mx.compile(shapeless=True)` | `models/qwen3.py` | One op instead of two per MLP per layer |
+| **`lm_head` over only the prediction row `[-2:-1]`** | `models/duplex_generate.py` | **3× cut on the 4096×153723 matmul (~9 ms saved)** |
+| Reuse `state.machine_state.last_frame_tokens` (Python list) | `models/duplex_generate.py` | Eliminates a `.tolist()` host sync per frame |
+| `mx.async_eval(text_logits, talker_out)` after talker | `models/duplex_generate.py` | Overlaps GPU dispatch with sample/state-machine Python path |
+| Logit-mask cache (4 entries cover all states) | `utils/state_machine.py` | Skips the 600 KB numpy→mlx copy after first frame |
+| Code-predictor KV cache reuse across frames | `models/generate.py` (prior pass) | ~13% on 28 s offline run |
+| `KVCache` accepts `list[int]` for `cache_position` | `modules/kv_cache.py`, `models/qwen3.py`, `models/raon.py` | Plumbing only — passive option after benchmarking didn't show net win |
+
+### `mx.compile` exploration (no win at the layer-or-larger scale)
+
+| Test | Raw | Compiled | Win |
+|---|---|---|---|
+| Single quantized linear | 0.31 ms | 0.30 ms | within noise |
+| Full MLP (3 quant matmuls) | 0.58 ms | 0.62 ms | slight regression |
+| 5-layer × 14-step autoregressive | 5.31 ms | 4.95 ms | **7%** |
+| 36-layer single forward (thinker scale) | 20.64 ms | 19.99 ms | **3%** |
+
+Conclusion: `mx.compile` only helps when there's a long lazy chain to fuse,
+and the marginal gain shrinks as compute share grows. For the thinker, the
+expected ~3% (~0.6 ms / frame) does not justify refactoring the cache to be
+functional (concat-only) and threading 36 (K, V) tuples through every
+callsite. We've left the existing path in place.
+
+### Further optimization candidates (not yet tried)
+
+- Reduce the per-frame thinker sequence from 3 → 1 token. Today we re-process
+  `[AIP, X, AOP]` each frame so the cache is rewritten with real audio
+  embeddings in AIP/AOP. With careful state separation we could update only
+  the audio positions, cutting attention work meaningfully. Larger refactor
+  of the duplex frame contract.
+- 4-bit thinker: known to produce gibberish in this duplex setup (errors
+  compound across frames); see Phase 7 notes. Would need quant-aware
+  retraining or careful per-layer mixed precision to be viable.
+- Drop the `audio_lm_head` EOS column to shrink `[2049, 2048]` → `[2048, 2048]`.
+  Trivial in fp16; needs a quant-aware row slice for 8-bit weights.
+
+### Tried and reverted
+
 - KV cache contiguous-write fast-path: replacing the per-position Python loop
   with a single slice assignment was *slower*, presumably because MLX's lazy
   graph prefers smaller writes that fuse with later ops.
 - Skipping the init second-pass forward (matching PT's flow exactly): clean
-  win for code clarity but no measurable perf change, because the bottleneck
-  is the sequential code-predictor loop, not the cache machinery.
+  win for code clarity but no measurable perf change.
+- Aligning with `mlx_lm`'s simpler cache pattern (drop `cache_position`,
+  drop the init second-pass forward): per-frame time regressed by ~14 ms
+  on the offline test (and first-frame jumped to ~3 s). The explicit-position
+  path appears to keep MLX's lazy graph from forcing a small sync that the
+  inferred-offset path triggers. Worth revisiting if a future MLX version
+  improves graph compilation.
+- Async-eval at end of `duplex_step` (decoded_audio + prev_audio_feedback) to
+  overlap with caller-side work: regressed in the bench harness because the
+  next frame's encoder runs immediately on the same GPU and contends with
+  the still-in-flight mimi decode. Kept the async-eval after the talker.
+- Passing `cache_position` as a Python list (instead of `mx.array`) through
+  the thinker stack: gave ~3% regression in the bench, presumably because
+  the list path materializes a tuple per layer where the array path is a
+  cheap view. Plumbing kept (the cache accepts both forms) but the duplex
+  caller continues to pass an `mx.array`.
 
-### Cleanup tried, reverted (worth knowing for future maintainers)
+## Known Issues / Soft Edges
 
-We attempted to align with `omlx` / `mlx_lm`'s simpler cache pattern: drop
-`cache_position`, drop the init second-pass forward, let the first duplex
-frame just append. The audio still rendered correctly, but **steady-state
-per-frame time regressed by ~14 ms** on the offline test (and the first
-frame jumped to ~3 s). Our best guess: MLX's lazy graph compiles a
-different (worse) plan when positions are inferred from `cache.offset`
-rather than passed in explicitly, possibly because the offset read forces
-a small synchronization that the explicit-position path avoids.
+- **Metal command-buffer race during rapid session restart** in the realtime
+  Gradio demo. Symptom: `failed assertion 'A command encoder is already
+  encoding to this command buffer'` followed by `SIGSEGV` (exit 139) when a
+  session is finished and a new one is started in quick succession. The
+  concurrent decoder + Metal command stream from the prior session hasn't
+  fully drained when the new session's first decoder call lands.
 
-If a future MLX version improves graph compilation or we move to a single
-`mx.compile`d step function, this regression should disappear and the
-cleanup is worth revisiting.
+  Workaround: wait ~1 s between Stop and Start, or refresh the page. Single
+  long-running sessions are unaffected. Suspected fix is a hard
+  `mx.synchronize()` + decoder-state reset on session teardown before
+  releasing the runtime to the next session, but the actual fix needs
+  reproduction with a debug build of MLX.
+
+- **External speakers + duplex**: the duplex model is full-duplex by design
+  and listens during its own speech. Browser-level AEC (we request
+  `echoCancellation: true`) handles built-in mic + built-in speakers
+  reasonably on macOS, but external speakers can produce a feedback loop.
+  Use headphones, or add server-side mic gating during the assistant
+  SPEECH phase if needed (loses barge-in).
 
 ## Open Questions
 

@@ -26,7 +26,7 @@ class KVCache:
         self,
         keys: mx.array,
         values: mx.array,
-        cache_position: mx.array | None = None,
+        cache_position: "mx.array | list[int] | tuple[int, ...] | None" = None,
     ) -> tuple[mx.array, mx.array]:
         """Update cache with new keys/values and return full cache.
 
@@ -34,12 +34,19 @@ class KVCache:
             keys: New key states [B, n_kv_heads, S, head_dim].
             values: New value states [B, n_kv_heads, S, head_dim].
             cache_position: If provided, explicit positions to write [S].
-                This enables overwriting specific cache positions (for duplex).
-                If None, appends sequentially at self.offset (standard behavior).
+                Accepts a Python sequence of ints (preferred — avoids a per-layer
+                host sync from ``.tolist()``) or an mx.array. Enables overwriting
+                specific cache positions (for duplex). If None, appends
+                sequentially at self.offset (standard behavior).
         """
         if cache_position is not None:
-            # Explicit position mode: write K/V at specified positions
-            pos = cache_position.tolist() if hasattr(cache_position, 'tolist') else list(cache_position)
+            # Explicit position mode: write K/V at specified positions.
+            # Prefer Python sequences — `.tolist()` on an mx.array forces a
+            # stream sync, and this is invoked once per layer per frame.
+            if isinstance(cache_position, (list, tuple)):
+                pos = list(cache_position)
+            else:
+                pos = cache_position.tolist()
             max_pos = max(pos) + 1
 
             # Ensure cache is large enough

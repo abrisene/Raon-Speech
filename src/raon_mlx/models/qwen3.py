@@ -2,11 +2,18 @@
 # Implements the "thinker" (36-layer Qwen3) used as Raon-Speech's language model backbone.
 
 from dataclasses import dataclass
+from functools import partial
 
 import mlx.core as mx
 import mlx.nn as nn
 
 from ..modules.kv_cache import KVCache, create_additive_causal_mask
+
+
+@partial(mx.compile, shapeless=True)
+def _swiglu(gate: mx.array, up: mx.array) -> mx.array:
+    """Fused SwiGLU activation: silu(gate) * up. Saves a per-layer dispatch."""
+    return nn.silu(gate) * up
 
 
 @dataclass
@@ -38,12 +45,24 @@ class Qwen3RMSNorm(nn.Module):
 
 
 class Qwen3RotaryEmbedding(nn.Module):
-    """RoPE for Qwen3 with configurable theta."""
+    """RoPE for Qwen3 with configurable theta.
+
+    Uses ``mx.fast.rope`` (a fused Metal kernel) when positions are sequential
+    from a fixed offset — the common case for the thinker/talker/code-predictor
+    autoregressive loop. Falls back to a manual implementation when explicit
+    ``position_ids`` are passed (used for duplex cache overwrite at non-contiguous
+    positions).
+    """
 
     def __init__(self, head_dim: int, theta: float = 5000000.0):
         super().__init__()
         self.head_dim = head_dim
         self.theta = theta
+        # Precomputed inverse frequencies for the manual fallback path.
+        # Shape: [head_dim // 2]. Computed once instead of every call.
+        self._inv_freq = 1.0 / mx.power(
+            theta, mx.arange(0, head_dim, 2, dtype=mx.float32) / head_dim
+        )
 
     def __call__(
         self,
@@ -52,14 +71,21 @@ class Qwen3RotaryEmbedding(nn.Module):
         offset: int = 0,
         position_ids: mx.array | None = None,
     ) -> tuple[mx.array, mx.array]:
-        if position_ids is not None:
-            # Explicit positions [1, seq_len] or [seq_len] — for duplex cache overwrite
-            positions = position_ids.reshape(-1).astype(mx.float32)
-        else:
-            seq_len = q.shape[2]
-            positions = mx.arange(offset, offset + seq_len, dtype=mx.float32)
-        dim = self.head_dim
-        freqs = positions[:, None] / mx.power(self.theta, mx.arange(0, dim, 2, dtype=mx.float32) / dim)
+        if position_ids is None:
+            # Fast path: sequential positions from offset. Fused Metal kernel.
+            q = mx.fast.rope(
+                q, self.head_dim, traditional=False,
+                base=self.theta, scale=1.0, offset=offset,
+            )
+            k = mx.fast.rope(
+                k, self.head_dim, traditional=False,
+                base=self.theta, scale=1.0, offset=offset,
+            )
+            return q, k
+
+        # Manual path: explicit positions (duplex cache overwrite).
+        positions = position_ids.reshape(-1).astype(mx.float32)
+        freqs = positions[:, None] * self._inv_freq[None, :]
         cos = mx.cos(freqs)  # [seq_len, dim//2]
         sin = mx.sin(freqs)  # [seq_len, dim//2]
         q = _apply_rope(q, cos, sin)
@@ -127,12 +153,9 @@ class Qwen3Attention(nn.Module):
         if cache is not None:
             k, v = cache.update_and_fetch(k, v, cache_position=cache_position)
 
-        # GQA: repeat KV heads to match Q heads
-        if self.n_kv_heads < self.n_heads:
-            n_rep = self.n_heads // self.n_kv_heads
-            k = mx.repeat(k, n_rep, axis=1)
-            v = mx.repeat(v, n_rep, axis=1)
-
+        # mx.fast.scaled_dot_product_attention handles GQA natively — k/v stay as
+        # [B, n_kv_heads, T, D]. Pre-tiling with mx.repeat materialized large tensors
+        # for nothing.
         out = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask=mask)
         out = out.transpose(0, 2, 1, 3).reshape(B, T, -1)
         return self.o_proj(out)
@@ -148,7 +171,7 @@ class Qwen3MLP(nn.Module):
         self.down_proj = nn.Linear(cfg.intermediate_size, cfg.hidden_size, bias=False)
 
     def __call__(self, xs: mx.array) -> mx.array:
-        return self.down_proj(nn.silu(self.gate_proj(xs)) * self.up_proj(xs))
+        return self.down_proj(_swiglu(self.gate_proj(xs), self.up_proj(xs)))
 
 
 class Qwen3DecoderLayer(nn.Module):
@@ -230,8 +253,12 @@ class Qwen3Model(nn.Module):
         # Build causal mask
         if mask is None and xs.shape[1] > 1:
             if cache_position is not None:
-                # Duplex mode: mask based on explicit positions
-                offset = int(cache_position[0].item())
+                # Duplex mode: mask based on explicit positions. Accept either
+                # a Python sequence (preferred — no host sync) or an mx.array.
+                if isinstance(cache_position, (list, tuple)):
+                    offset = int(cache_position[0])
+                else:
+                    offset = int(cache_position[0].item())
                 mask = create_additive_causal_mask(xs.shape[1], offset)
             else:
                 offset = cache[0].offset if cache is not None else 0

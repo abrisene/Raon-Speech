@@ -211,6 +211,9 @@ python demo/gradio_mlx_duplex_demo.py \
     --model-path models/Raon-SpeechChat-9B-mlx-8bit \
     --hf-model-path models/Raon-SpeechChat-9B \
     --quantize 8bit
+
+# Deterministic per-frame bench (reports avg_frame_ms and RTF over N runs):
+PYTHONPATH=src python scripts/bench_duplex.py --runs 8
 ```
 
 Acceptance criteria:
@@ -218,9 +221,13 @@ Acceptance criteria:
       conversation.wav whose right channel resolves as intelligible English speech.
 - [ ] `frame_log.txt` shows `out_rms ≈ 0.0002` on `[SIL]` frames (silence) and
       `0.01–0.10` on `[SPEECH]` frames.
+- [ ] `scripts/bench_duplex.py --runs 8` reports mean RTF < 0.85 (current
+      baseline ~0.78 on M-series, 8-bit, after the 2026-04-28 perf pass).
 - [ ] Realtime demo streams without Metal command-buffer assertions during a
-      single sustained session (rapid open/close cycles can race the decoder
-      thread; this is a known soft-edge).
+      single sustained session. Rapid Stop→Start cycles can hit a Metal race
+      that produces `failed assertion 'A command encoder is already encoding
+      to this command buffer'` and `SIGSEGV` (exit 139); this is a known
+      soft-edge — wait ~1 s between Stop and Start, or refresh the page.
 
 ## Audio Files Generated During Development
 

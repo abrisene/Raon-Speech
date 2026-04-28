@@ -69,6 +69,11 @@ class DuplexStateManager:
 
     def __init__(self, config: DuplexStateConfig) -> None:
         self._config = config
+        # Logit-mask cache. The mask itself depends only on (phase, context-class)
+        # and a fixed vocab size, so we lazily memoize it after first construction
+        # and reuse across frames — avoids a 600 KB numpy → mlx copy per frame.
+        # Key: (phase_str, context_class, vocab_size)
+        self._mask_cache: dict[tuple[str, str, int], "mx.array"] = {}
 
     @property
     def config(self) -> DuplexStateConfig:
@@ -159,9 +164,9 @@ class DuplexStateManager:
     ) -> mx.array:
         """Mask logits to enforce valid state-machine transitions.
 
-        Builds an additive mask (0 for allowed, -inf for blocked) using
-        numpy for construction, then converts to mx.array for the final add.
-        Avoids -inf + inf = NaN issues with pure MLX at() operations.
+        Builds an additive mask (0 for allowed, -inf for blocked). The mask only
+        depends on (phase, context-class, vocab) and a fixed config — cached
+        on the manager to skip the numpy → mlx copy after the first frame.
 
         Args:
             user_logits: Shape [1, 1, vocab] or [1, seq, vocab].
@@ -171,6 +176,54 @@ class DuplexStateManager:
         Returns:
             Masked logits with invalid tokens set to -inf.
         """
+        V = user_logits.shape[-1]
+        ctx_class = self._classify_mask_context(state)
+        cache_key = (state.phase.value, ctx_class, V)
+
+        mask = self._mask_cache.get(cache_key)
+        if mask is None:
+            mask = self._build_mask(state.phase, ctx_class, V, vocab_size)
+            self._mask_cache[cache_key] = mask
+        return user_logits + mask
+
+    def _classify_mask_context(self, state: DuplexMachineState) -> str:
+        """Classify the SPEECH-phase context token into one of the mask buckets.
+
+        SIL phase ignores this. For SPEECH we partition into:
+          'onset'    — last context was EPAD/BC (only text allowed next)
+          'text'     — last context was a regular text token
+          'pad'      — last context was PAD/SIL/blocked (only PAD/EPAD/SIL allowed)
+          'na'       — SIL phase, classifier unused
+        """
+        if state.phase == DuplexPhase.SIL:
+            return "na"
+        cfg = self._config
+        epad_id = cfg.duplex_end_pad_token_id
+        bc_id = cfg.duplex_bc_token_id
+        sil_id = cfg.duplex_sil_token_id
+        pad_id = cfg.duplex_pad_token_id
+
+        onset_ids = {epad_id}
+        if cfg.use_backchannel_token:
+            onset_ids.add(bc_id)
+
+        ctx = self._extract_context_token(state)
+        if ctx is None:
+            return "pad"
+        if ctx in onset_ids:
+            return "onset"
+        if ctx not in (BLOCKED_STRUCTURAL | onset_ids | {pad_id, sil_id}):
+            return "text"
+        return "pad"
+
+    def _build_mask(
+        self,
+        phase: DuplexPhase,
+        ctx_class: str,
+        V: int,
+        vocab_size: int,
+    ) -> mx.array:
+        """Construct the additive logit mask for a given (phase, context-class)."""
         import numpy as np
 
         cfg = self._config
@@ -183,59 +236,40 @@ class DuplexStateManager:
         if cfg.use_backchannel_token:
             onset_ids.add(bc_id)
 
-        V = user_logits.shape[-1]
-        # Build mask in numpy: 0.0 = allowed, -inf = blocked
         mask_np = np.full(V, -np.inf, dtype=np.float32)
 
-        if state.phase == DuplexPhase.SIL:
-            # Only SIL, EPAD, and optionally BC allowed
+        if phase == DuplexPhase.SIL:
             if 0 <= sil_id < V:
                 mask_np[sil_id] = 0.0
             if cfg.use_duplex_end_pad and 0 <= epad_id < V:
                 mask_np[epad_id] = 0.0
             if cfg.use_backchannel_token and 0 <= bc_id < V:
                 mask_np[bc_id] = 0.0
+        elif ctx_class == "onset":
+            mask_np[:vocab_size] = 0.0
+            for block_id in BLOCKED_STRUCTURAL | {sil_id, pad_id} | onset_ids:
+                if 0 <= block_id < V:
+                    mask_np[block_id] = -np.inf
+        elif ctx_class == "text":
+            mask_np[:vocab_size] = 0.0
+            if 0 <= pad_id < V:
+                mask_np[pad_id] = 0.0
+            if 0 <= epad_id < V:
+                mask_np[epad_id] = 0.0
+            if 0 <= sil_id < V:
+                mask_np[sil_id] = 0.0
+            for block_id in BLOCKED_STRUCTURAL:
+                if 0 <= block_id < V:
+                    mask_np[block_id] = -np.inf
+        else:  # 'pad'
+            if 0 <= pad_id < V:
+                mask_np[pad_id] = 0.0
+            if 0 <= epad_id < V:
+                mask_np[epad_id] = 0.0
+            if 0 <= sil_id < V:
+                mask_np[sil_id] = 0.0
 
-        elif state.phase == DuplexPhase.SPEECH:
-            context_token = self._extract_context_token(state)
-
-            if context_token is not None and context_token in onset_ids:
-                # After EPAD/BC onset: only text tokens allowed
-                mask_np[:vocab_size] = 0.0
-                # Block structural + control tokens
-                for block_id in BLOCKED_STRUCTURAL | {sil_id, pad_id} | onset_ids:
-                    if 0 <= block_id < V:
-                        mask_np[block_id] = -np.inf
-
-            elif (
-                context_token is not None
-                and context_token not in (BLOCKED_STRUCTURAL | onset_ids | {pad_id, sil_id})
-            ):
-                # After text: text + PAD + EPAD + SIL allowed
-                mask_np[:vocab_size] = 0.0
-                if 0 <= pad_id < V:
-                    mask_np[pad_id] = 0.0
-                if 0 <= epad_id < V:
-                    mask_np[epad_id] = 0.0
-                if 0 <= sil_id < V:
-                    mask_np[sil_id] = 0.0
-                # Block structural tokens
-                for block_id in BLOCKED_STRUCTURAL:
-                    if 0 <= block_id < V:
-                        mask_np[block_id] = -np.inf
-
-            else:
-                # PAD frame: PAD + EPAD + SIL allowed
-                if 0 <= pad_id < V:
-                    mask_np[pad_id] = 0.0
-                if 0 <= epad_id < V:
-                    mask_np[epad_id] = 0.0
-                if 0 <= sil_id < V:
-                    mask_np[sil_id] = 0.0
-
-        # Broadcast to match user_logits shape and add
-        mask = mx.array(mask_np)
-        return user_logits + mask
+        return mx.array(mask_np)
 
     def _extract_context_token(self, state: DuplexMachineState) -> int | None:
         tokens = state.last_frame_tokens

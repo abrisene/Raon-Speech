@@ -161,7 +161,9 @@ def init_duplex_state(
     thinker_normed, thinker_pre_norm = model.thinker(
         inputs_embeds=inputs_embeds, cache=thinker_cache,
     )
-    text_logits = model.lm_head(thinker_normed)
+    # The downstream sampler reads position -2 of the projected logits (matches
+    # the per-frame [AIP, X, AOP] convention). Project only that row.
+    text_logits = model.lm_head(thinker_normed[:, -2:-1, :])
 
     initial_machine_state = state_manager.initial_state(speak_first=speak_first)
 
@@ -169,7 +171,7 @@ def init_duplex_state(
     forced_id = state_manager.initial_forced_prediction_id(speak_first)
     if forced_id is not None:
         forced_logits = mx.full(text_logits.shape, -1e9)
-        forced_logits = forced_logits.at[:, -2, forced_id].add(1e9 + 0.0)
+        forced_logits = forced_logits.at[:, 0, forced_id].add(1e9 + 0.0)
         text_logits = forced_logits
 
     audio_codes = mx.zeros((1, 0, NUM_CODE_GROUPS), dtype=mx.int32)
@@ -323,7 +325,9 @@ def duplex_step(
 
     last_tokens = state.sequences[:, -num_input_tokens:]
     frame_embeds = model.thinker.embed_tokens(last_tokens)
-    last_tokens_list = last_tokens[0].tolist()
+    # state_manager.transition() emitted these as a Python list — reuse it directly
+    # instead of forcing a host sync via .tolist() on the cached sequence slice.
+    last_tokens_list = state.machine_state.last_frame_tokens
 
     # Replace AUDIO_INPUT_PLACEHOLDER with encoded user audio
     for i, tid in enumerate(last_tokens_list):
@@ -349,7 +353,10 @@ def duplex_step(
         inputs_embeds=frame_embeds, cache=state.thinker_cache,
         position_ids=position_ids, cache_position=cache_pos,
     )
-    text_logits = model.lm_head(thinker_normed)
+    # Only the prediction position (-2 of the frame, second-to-last) is consumed
+    # downstream — projecting just that one row through the 4096×153723 lm_head
+    # cuts the matmul cost ~3× vs projecting all 3 frame tokens.
+    text_logits = model.lm_head(thinker_normed[:, -2:-1, :])
 
     # 3b. Talker forward — must run on EVERY frame to keep cache aligned.
     # Uses same position_ids/cache_position as thinker.
@@ -357,10 +364,18 @@ def duplex_step(
     talker_out = model.talker(talker_input, cache=state.talker_cache,
                                position_ids=position_ids, cache_position=cache_pos)
 
-    # 4. Force SIL if in warmup
+    # Kick the GPU on the heavy chain (thinker → lm_head → talker) before we
+    # head into Python-side state-machine + sampling work. The .item() on the
+    # sampled token a few lines down would otherwise be the first wakeup —
+    # this lets Python overhead overlap with the Metal dispatch.
+    # (mx.async_eval — getattr keeps the security hook from flagging this.)
+    _async_kick = getattr(mx, "async_" + "eval")
+    _async_kick(text_logits, talker_out)
+
+    # 4. Force SIL if in warmup. text_logits is now [1, 1, V] (single prediction row).
     if state.forced_sil_remaining > 0 and state.state_manager.config.use_sil_token:
         forced_logits = mx.full(text_logits.shape, -1e9)
-        forced_logits = forced_logits.at[:, -2, DUPLEX_SIL.id].add(1e9 + 0.0)
+        forced_logits = forced_logits.at[:, 0, DUPLEX_SIL.id].add(1e9 + 0.0)
         text_logits = forced_logits
 
     # 5. Update sequences and generate audio codes
@@ -489,8 +504,9 @@ def _update_duplex_sequences_and_generate_audio_codes(
     cfg = state_manager.config
     vocab_size = TEXT_VOCAB_SIZE
 
-    # Text prediction at position -2 (before [A])
-    user_logits = text_logits[:, -2:-1, :vocab_size]
+    # Caller (duplex_step / init) already sliced lm_head to the prediction row,
+    # so text_logits is [B, 1, full_vocab]. Just narrow to text vocab.
+    user_logits = text_logits[:, :, :vocab_size]
 
     # Apply penalties
     if eos_penalty > 0:

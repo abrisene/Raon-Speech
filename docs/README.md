@@ -125,7 +125,8 @@ Input audio → AuT encoder (24L Whisper-like) → Input adaptor (MLP 2048→409
 
 ## Full-Duplex (Raon-SpeechChat-9B)
 
-End-to-end realtime duplex on MLX, RTF ~1.0 on M-series:
+End-to-end realtime duplex on MLX, **RTF ~0.78 on M-series** (8-bit, 80 ms
+frames, ~16 ms headroom — 2026-04-28 perf pass).
 
 ```bash
 # Pre-convert at uniform 8-bit (10.32 GB; 4-bit thinker is too lossy for duplex):
@@ -140,11 +141,20 @@ python demo/gradio_mlx_duplex_demo.py \
 
 # Offline duplex run on a 24kHz mono wav:
 python scripts/run_offline_test.py
+
+# Deterministic per-frame bench (8 runs, fixed seed):
+PYTHONPATH=src python scripts/bench_duplex.py --runs 8
 ```
 
-See [Phase 7 in the roadmap](mlx-port-roadmap.md) and
+See [Phase 7 in the roadmap](mlx-port-roadmap.md), the
+[Duplex Performance Profile](mlx-port-roadmap.md#duplex-performance-profile-8-bit-m-series)
+section for the per-section breakdown and applied optimizations, and
 [`docs/mlx-duplex-debug-log.md`](mlx-duplex-debug-log.md) for the duplex bug
 hunt and per-module parity proofs.
+
+Known soft-edge: the realtime demo can hit a Metal command-buffer race on
+rapid Stop→Start session cycles (`SIGSEGV` exit 139). Wait ~1 s between
+sessions or refresh the page; single sustained sessions are unaffected.
 
 ## Known Limitations
 
