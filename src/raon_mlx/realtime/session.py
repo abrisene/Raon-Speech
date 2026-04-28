@@ -45,6 +45,8 @@ class SamplingConfig:
     temperature: float = 0.9
     top_k: int = 66
     top_p: float = 0.99
+    code_temperature: float = 0.0
+    code_top_k: int = 10
     eos_penalty: float = 0.0
     sil_penalty: float = 0.0
     bc_penalty: float = 0.0
@@ -53,7 +55,10 @@ class SamplingConfig:
 @dataclass
 class SessionConfig:
     session_id: str = ""
-    prompt: str = "You are engaging in real-time conversation."
+    prompt: str = "eng:full_duplex:listen-first"
+    prompt_role: str = "system"
+    persona: str | None = None
+    persona_context: str | None = None
     speak_first: bool = False
     speaker_audio: str | None = None
     sampling: SamplingConfig = field(default_factory=SamplingConfig)
@@ -108,15 +113,30 @@ class MLXRealtimeDuplexSession:
                 hf_model_path = model_path
         self._hf_model_path = hf_model_path
 
+        prompt_role = str(session_payload.get("prompt_role", "system"))
+        prompt_text = str(session_payload.get("prompt", "eng:full_duplex:listen-first"))
+        persona = session_payload.get("persona")
+        persona_context = session_payload.get("persona_context")
+
         self._config = SessionConfig(
             session_id=session_id,
-            prompt=str(session_payload.get("prompt", "You are engaging in real-time conversation.")),
+            prompt=_resolve_prompt(
+                prompt_text,
+                prompt_role,
+                persona=str(persona) if persona is not None else None,
+                persona_context=str(persona_context) if persona_context is not None else None,
+            ),
+            prompt_role=prompt_role,
+            persona=str(persona) if persona is not None else None,
+            persona_context=str(persona_context) if persona_context is not None else None,
             speak_first=bool(session_payload.get("speak_first", False)),
             speaker_audio=session_payload.get("speaker_audio"),
         )
         self._config.sampling.temperature = float(sampling_payload.get("temperature", 0.9))
         self._config.sampling.top_k = int(sampling_payload.get("top_k", 66))
         self._config.sampling.top_p = float(sampling_payload.get("top_p", 0.99))
+        self._config.sampling.code_temperature = float(sampling_payload.get("code_temperature", 0.0))
+        self._config.sampling.code_top_k = int(sampling_payload.get("code_top_k", 10))
         self._config.sampling.eos_penalty = float(sampling_payload.get("eos_penalty", 0.0))
         self._config.sampling.sil_penalty = float(sampling_payload.get("sil_penalty", 0.0))
         self._config.sampling.bc_penalty = float(sampling_payload.get("bc_penalty", 0.0))
@@ -131,7 +151,7 @@ class MLXRealtimeDuplexSession:
         model, tokenizer = get_mlx_runtime(
             model_path=model_path,
             hf_model_path=self._hf_model_path,
-            quantize=str((runtime or {}).get("quantize", "hybrid")),
+            quantize=str((runtime or {}).get("quantize", "8bit")),
         )
         self._model = model
         self._tokenizer = tokenizer
@@ -395,13 +415,13 @@ def get_mlx_runtime(
     *,
     model_path: str,
     hf_model_path: str | None = None,
-    quantize: str = "hybrid",
+    quantize: str = "8bit",
 ) -> tuple:
     """Return (model, tokenizer) singleton for the given model path."""
     import mlx.core as mx
     import mlx.nn as nn
 
-    cache_key = f"{model_path}:{quantize}"
+    cache_key = f"{model_path}:{hf_model_path or ''}:{quantize}"
     with _RUNTIME_LOCK:
         if cache_key in _RUNTIME_CACHE:
             return _RUNTIME_CACHE[cache_key]
@@ -438,11 +458,31 @@ def get_mlx_runtime(
     elif quantize == "4bit":
         nn.quantize(model.thinker, bits=4, group_size=64)
 
-    # Load tokenizer — try HF model path first (has tokenizer files),
-    # fall back to model_path if not specified
-    from transformers import AutoTokenizer
+    # Load tokenizer via the canonical processor so special-token alignment and
+    # duplex-specific config attributes match the original HF checkpoint.
+    from raon.utils.processor import RaonProcessor
+
     tokenizer_path = hf_model_path or model_path
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=False)
+    processor = RaonProcessor.from_pretrained(tokenizer_path)
+    tokenizer = processor.tokenizer
+    model.use_duplex_end_pad = bool(getattr(processor, "use_duplex_end_pad", False))
+    model.use_sil_token = bool(getattr(processor, "use_sil_token", False))
+    model.no_audio_in_sil = bool(getattr(processor, "no_audio_in_sil", False))
+    model.sequence_mode = getattr(processor, "sequence_mode", "uta")
+    model.duplex_pad_token_id = int(getattr(processor, "duplex_pad_token_id", 0))
+    model.duplex_end_pad_token_id = int(getattr(processor, "duplex_end_pad_token_id", 0))
+    model.duplex_sil_token_id = int(getattr(processor, "duplex_sil_token_id", 0))
+    model.use_backchannel_token = bool(getattr(processor, "use_backchannel_token", False))
+    model.duplex_bc_token_id = int(getattr(processor, "duplex_bc_token_id", 0))
+    model.speaker_token_id = getattr(processor, "speaker_token_id", None)
+    model.audio_start_token_id = int(getattr(processor, "audio_start_token_id", 0))
+    model.audio_input_token_id = int(getattr(processor, "audio_input_token_id", 0))
+    model.audio_output_token_id = int(getattr(processor, "audio_output_token_id", 0))
+    model.im_start_token_id = int(getattr(processor, "im_start_token_id", 0))
+    model.text_vocab_size = int(
+        getattr(processor, "audio_output_token_id", 0)
+        or (int(getattr(model.thinker.cfg, "vocab_size", 0)) - 2048)
+    )
 
     # Warmup Mimi
     model.mimi.reset_all()
@@ -458,3 +498,47 @@ def get_mlx_runtime(
 def create_session(**kwargs: Any) -> MLXRealtimeDuplexSession:
     """Factory used by the runtime manager to build the active session."""
     return MLXRealtimeDuplexSession(**kwargs)
+
+
+def _resolve_prompt(
+    prompt_text: str,
+    prompt_role: str,
+    *,
+    persona: str | None = None,
+    persona_context: str | None = None,
+) -> str:
+    """Resolve realtime duplex prompt keys to the full system prompt text."""
+    if prompt_role != "system":
+        return prompt_text
+
+    from raon.utils.duplex_data import CHANNEL_DUPLEX_TO_SYSTEM_MESSAGE, get_duplex_system_message_key
+    from raon.utils.duplex_prompt_catalog import build_system_prompt
+
+    if persona is not None:
+        return build_system_prompt(persona=persona, context=persona_context, deterministic=True)
+
+    if prompt_text in CHANNEL_DUPLEX_TO_SYSTEM_MESSAGE:
+        return CHANNEL_DUPLEX_TO_SYSTEM_MESSAGE[prompt_text]
+
+    parts = [part.strip() for part in prompt_text.split(":") if part.strip()]
+    if len(parts) == 2:
+        language = "eng"
+        channel, speak_mode = parts
+    elif len(parts) == 3:
+        language, channel, speak_mode = parts
+    else:
+        return prompt_text
+
+    if language != "eng":
+        return prompt_text
+    if channel not in {"full_duplex", "duplex_instruct"}:
+        return prompt_text
+    if speak_mode not in {"speak-first", "listen-first"}:
+        return prompt_text
+
+    key = get_duplex_system_message_key(
+        language=language,  # type: ignore[arg-type]
+        channel=channel,  # type: ignore[arg-type]
+        speak_first=(speak_mode == "speak-first"),
+    )
+    return CHANNEL_DUPLEX_TO_SYSTEM_MESSAGE.get(key, prompt_text)

@@ -38,7 +38,7 @@ class RaonMLXPipeline:
         self,
         model_path: str,
         hf_model_path: str | None = None,
-        quant: str = "hybrid",
+        quant: str = "8bit",
     ) -> None:
         """Load model and processor.
 
@@ -73,20 +73,25 @@ class RaonMLXPipeline:
         # Load MLX model
         logger.info("Loading MLX model from %s", model_path)
         self.model = RaonMLX()
-        self.model.load_weights_from_raon(model_path)
+        model_dir = Path(model_path)
+        is_mlx_model = (model_dir / "model.safetensors").exists() and (model_dir / "config.json").exists()
+        if is_mlx_model:
+            self.model.load_mlx_weights(model_path)
+        else:
+            self.model.load_weights_from_raon(model_path)
 
-        if quant == "4bit":
-            nn.quantize(self.model.thinker, bits=4, group_size=64)
-            nn.quantize(self.model.talker, bits=4, group_size=64)
-            nn.quantize(self.model.code_predictor.model, bits=4, group_size=64)
-        elif quant == "8bit":
-            nn.quantize(self.model.thinker, bits=8, group_size=64)
-            nn.quantize(self.model.talker, bits=8, group_size=64)
-            nn.quantize(self.model.code_predictor.model, bits=8, group_size=64)
-        elif quant == "hybrid":
-            nn.quantize(self.model.thinker, bits=4, group_size=64)
-            nn.quantize(self.model.talker, bits=8, group_size=64)
-            nn.quantize(self.model.code_predictor.model, bits=8, group_size=64)
+            if quant == "4bit":
+                nn.quantize(self.model.thinker, bits=4, group_size=64)
+                nn.quantize(self.model.talker, bits=4, group_size=64)
+                nn.quantize(self.model.code_predictor.model, bits=4, group_size=64)
+            elif quant == "8bit":
+                nn.quantize(self.model.thinker, bits=8, group_size=64)
+                nn.quantize(self.model.talker, bits=8, group_size=64)
+                nn.quantize(self.model.code_predictor.model, bits=8, group_size=64)
+            elif quant == "hybrid":
+                nn.quantize(self.model.thinker, bits=4, group_size=64)
+                nn.quantize(self.model.talker, bits=8, group_size=64)
+                nn.quantize(self.model.code_predictor.model, bits=8, group_size=64)
 
         logger.info("MLX pipeline ready (quant=%s)", quant)
 

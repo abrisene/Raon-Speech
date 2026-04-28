@@ -54,12 +54,53 @@ def sample_token(logits: mx.array, temperature: float = 1.0, top_k: int = 20, to
     return mx.random.categorical(mx.log(probs + 1e-10))[:, None]
 
 
+def _apply_ras(
+    sampled_code: mx.array,
+    raw_logits: mx.array,
+    prior_first_codes: mx.array | None,
+    window_size: int = 40,
+    repetition_threshold: float = 0.1,
+    skip_frames: int = 0,
+) -> mx.array:
+    """Repetition-aware sampling for the first audio codebook.
+
+    If the sampled code appears in the recent window of first-group codes more
+    often than ``repetition_threshold``, resample from the raw (unfiltered) logit
+    distribution. This breaks repetition loops that tight top-k/top-p sampling
+    can fall into. Mirrors PT's ``apply_repetition_aware_sampling``.
+
+    Args:
+        sampled_code: [B, 1] previously sampled first-codebook value.
+        raw_logits: [B, vocab] unfiltered first-codebook logits.
+        prior_first_codes: [B, num_prior_frames] prior first-codebook history,
+            or None when no history exists yet.
+    """
+    if prior_first_codes is None or prior_first_codes.shape[1] <= skip_frames:
+        return sampled_code
+    window = prior_first_codes[:, max(0, prior_first_codes.shape[1] - window_size):]
+    if window.shape[1] == 0:
+        return sampled_code
+    matches = (window == sampled_code).astype(mx.float32).sum(axis=1, keepdims=True)
+    ratio = matches / float(window.shape[1])
+    needs_resample = ratio[:, 0] > repetition_threshold
+    if not bool(needs_resample.any().item()):
+        return sampled_code
+    raw_probs = mx.softmax(raw_logits.astype(mx.float32), axis=-1)
+    raw_probs = mx.maximum(raw_probs, 1e-10)
+    resampled = mx.random.categorical(mx.log(raw_probs))[:, None]
+    return mx.where(needs_resample[:, None], resampled, sampled_code)
+
+
 def generate_audio_codes(
     model: RaonMLX,
     talker_hidden: mx.array,
     temperature: float = 1.2,
     top_k: int = 20,
     suppress_eos: bool = False,
+    prior_first_codes: mx.array | None = None,
+    ras_enabled: bool = False,
+    ras_window_size: int = 40,
+    ras_repetition_threshold: float = 0.1,
 ) -> mx.array:
     """Generate 16 audio codebook codes from the talker's last hidden state.
 
@@ -90,8 +131,17 @@ def generate_audio_codes(
     if suppress_eos and first_logits.shape[-1] > codebook_size:
         # Suppress AUDIO_END token (index 2048)
         first_logits = first_logits.at[..., codebook_size].add(-1e9)
+    raw_first_logits = first_logits  # snapshot before top-k/top-p filtering for RAS
     if temperature > 0:
         first_code = sample_token(first_logits, temperature=temperature, top_k=top_k, top_p=1.0)
+        if ras_enabled:
+            first_code = _apply_ras(
+                first_code,
+                raw_first_logits,
+                prior_first_codes,
+                window_size=ras_window_size,
+                repetition_threshold=ras_repetition_threshold,
+            )
     else:
         first_code = first_logits.argmax(axis=-1, keepdims=True)  # [B, 1]
 
@@ -112,31 +162,21 @@ def generate_audio_codes(
 
     codes = [first_code[:, 0]]  # list of [B] arrays
 
-    # First predicted code (codebook 2): use last hidden from prefill
+    # First predicted code (codebook 2): use last hidden from prefill.
+    # Match PT: greedy for codebooks 2-16 (only codebook 1 samples).
     logits = cp_out[:, -1:] @ model.code_predictor.fused_lm_head[0].T  # [B, 1, 2048]
     logits = logits[:, 0]  # [B, 2048]
-    if temperature > 0:
-        next_code = sample_token(logits, temperature=temperature, top_k=top_k, top_p=1.0)[:, 0]
-    else:
-        next_code = logits.argmax(axis=-1)
+    next_code = logits.argmax(axis=-1)
     codes.append(next_code)
 
-    # Remaining codebooks 3-16
+    # Remaining codebooks 3-16 — greedy, matching PT's predict_codes
     for i in range(1, num_code_groups - 1):
-        # Embed the last predicted code with group offset
         code_input = next_code[:, None] + (i * codebook_size)
         code_emb = model.code_predictor.codec_embedding(code_input)  # [B, 1, 1024]
-
-        # Run through code predictor (single step with cache)
         cp_out = model.code_predictor.model(inputs_embeds=code_emb, cache=cp_cache)  # [B, 1, 1024]
-
-        # Get logits for next codebook
         logits = cp_out[:, -1:] @ model.code_predictor.fused_lm_head[i].T  # [B, 1, 2048]
         logits = logits[:, 0]  # [B, 2048]
-        if temperature > 0:
-            next_code = sample_token(logits, temperature=temperature, top_k=top_k, top_p=1.0)[:, 0]
-        else:
-            next_code = logits.argmax(axis=-1)
+        next_code = logits.argmax(axis=-1)
         codes.append(next_code)
 
     all_codes = mx.stack(codes, axis=1)  # [B, 16]

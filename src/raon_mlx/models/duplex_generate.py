@@ -386,7 +386,11 @@ def duplex_step(
     )
 
     # 6. Decode audio output
-    is_sil_frame = not new_machine_state.emitted_audio
+    # NOTE: MLX uses phase-based SIL detection rather than emitted_audio (which is
+    # always True since the chunk always contains AUDIO_OUTPUT_PLACEHOLDER). When in
+    # SIL phase, force silence_codes to the streaming decoder so the audio output is
+    # silent during listening — matches PT's effective behavior.
+    is_sil_frame = new_machine_state.phase == DuplexPhase.SIL
     new_semantic_buffer = state.semantic_buffer
     prev_audio_feedback = state.prev_audio_feedback
 
@@ -397,6 +401,10 @@ def duplex_step(
             silence = _get_silence_codes(model)
         silence_frame = silence[None, :, None]
         decoded_audio = model.mimi.decode_step(silence_frame)
+        # Also feed silence as the talker's prev_audio_feedback so the talker cache
+        # evolves on a "silence" trajectory during SIL. This matches PT's effective
+        # behavior where the model naturally produces silence-like codes during SIL.
+        prev_audio_feedback = _get_audio_output_embed(model, silence[None, :])
     else:
         if new_audio_codes.shape[1] > prev_audio_codes_len:
             current_codes = new_audio_codes[0, -1]  # [16]
@@ -517,9 +525,14 @@ def _update_duplex_sequences_and_generate_audio_codes(
     is_in_speech = machine_state.phase == DuplexPhase.SPEECH
     new_audio_codes_frame = None
 
+    prior_first_codes = (
+        audio_codes[:, :, 0] if audio_codes.shape[1] > 0 else None
+    )
+
     if is_in_speech:
         new_audio_codes_frame = generate_audio_codes(
-            model, talker_out[:, -1:], temperature=1.2, top_k=top_k, suppress_eos=True,
+            model, talker_out[:, -1:], temperature=temperature, top_k=top_k, suppress_eos=True,
+            prior_first_codes=prior_first_codes,
         )
 
     # State machine transition
@@ -530,7 +543,8 @@ def _update_duplex_sequences_and_generate_audio_codes(
     # Onset frame (SIL -> SPEECH): generate codes from talker output
     if emitted_audio and new_audio_codes_frame is None:
         new_audio_codes_frame = generate_audio_codes(
-            model, talker_out[:, -1:], temperature=1.2, top_k=top_k, suppress_eos=True,
+            model, talker_out[:, -1:], temperature=temperature, top_k=top_k, suppress_eos=True,
+            prior_first_codes=prior_first_codes,
         )
 
     # Append audio codes
@@ -627,7 +641,11 @@ def run_duplex_offline(
     all_text_ids: list[int] = []
     frame_times: list[float] = []
 
+    frame_log_path = output_path / "frame_log.txt"
+    frame_log = open(str(frame_log_path), "w", buffering=1)
+
     logger.info(f"Running duplex: {num_frames} frames ({num_samples / sr:.2f}s)")
+    prev_seq_len = state.sequences.shape[1]
     for i in range(num_frames):
         start_idx = i * SAMPLES_PER_FRAME
         frame_pcm = audio_data[start_idx:start_idx + SAMPLES_PER_FRAME]
@@ -642,10 +660,37 @@ def run_duplex_offline(
         output_frames.append(out_np)
         all_text_ids.extend(text_ids)
 
+        cur_seq_len = state.sequences.shape[1]
+        new_token_ids = state.sequences[0, prev_seq_len:cur_seq_len].tolist()
+        prev_seq_len = cur_seq_len
+
+        text_decoded = "-"
+        if text_ids:
+            try:
+                text_decoded = repr(tokenizer.decode(text_ids, skip_special_tokens=False))
+            except Exception:
+                text_decoded = repr(text_ids)
+        elif new_token_ids:
+            try:
+                text_decoded = repr(tokenizer.decode(new_token_ids, skip_special_tokens=False))
+            except Exception:
+                text_decoded = "-"
+
         phase = state.machine_state.phase.value
+        in_rms = float(np.sqrt(np.mean(frame_pcm.astype(np.float32) ** 2)))
+        out_rms = float(np.sqrt(np.mean(out_np ** 2)))
+        ntok = state.machine_state.num_input_tokens
+        last_codes = state.audio_codes[0, -1].tolist() if state.audio_codes.shape[1] > 0 else []
+        frame_log.write(
+            f"[{phase.upper()}] f={i} text={text_decoded} "
+            f"out_rms={out_rms:.4f} in_rms={in_rms:.4f} ntok={ntok} "
+            f"new_tok_ids={new_token_ids} last_codes={last_codes}\n"
+        )
+
         if (i + 1) % 25 == 0 or i == 0:
             avg_ms = np.mean(frame_times[-25:]) * 1000
             logger.info(f"  Frame {i + 1}/{num_frames} [{phase}] avg={avg_ms:.1f}ms")
+    frame_log.close()
 
     # Save outputs
     assistant_audio = np.concatenate(output_frames)
