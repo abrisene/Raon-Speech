@@ -124,7 +124,7 @@ def init_duplex_state(
     )
     state_manager = DuplexStateManager(state_config)
 
-    # Initialize PyTorch streaming audio encoder
+    # Initialize MLX streaming audio encoder (pure MLX; replaces prior PyTorch wrapper)
     from ..utils.streaming_encoder import get_streaming_encoder
     streaming_encoder = get_streaming_encoder(hf_model_path)
     streaming_encoder.reset()
