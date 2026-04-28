@@ -69,9 +69,44 @@ pipe.save_audio((audio, sr), "output.wav")
 # STT
 text = pipe.stt("input.wav")
 
-# SpeechChat
+# SpeechChat (one-shot — user audio → assistant text + audio)
 response = pipe.speech_chat("input.wav")
 ```
+
+### Full-duplex realtime (Raon-SpeechChat-9B)
+
+The realtime duplex path needs **uniform 8-bit quant** (not hybrid). Pre-convert
+once for fast loads:
+
+```bash
+python -m raon_mlx.utils.convert models/Raon-SpeechChat-9B \
+    --output models/Raon-SpeechChat-9B-mlx-8bit --quant 8bit
+```
+
+Then either run offline against a 24kHz mono wav:
+
+```bash
+python scripts/run_offline_test.py
+# wraps RaonMLXPipeline.duplex; writes assistant.wav, conversation.wav,
+# transcript.txt, frame_log.txt, summary.json
+```
+
+…or boot the FastAPI + Gradio realtime demo:
+
+```bash
+python demo/gradio_mlx_duplex_demo.py \
+    --host 127.0.0.1 --port 7862 \
+    --model-path models/Raon-SpeechChat-9B-mlx-8bit \
+    --hf-model-path models/Raon-SpeechChat-9B \
+    --quantize 8bit
+# open http://127.0.0.1:7862
+```
+
+Why 8-bit not hybrid: the duplex loop runs the thinker hundreds of times per
+session and even small per-forward errors compound. Hybrid (4-bit thinker)
+produces gibberish audio in the duplex setting; per-utterance TTS is fine. See
+`docs/mlx-port-roadmap.md` Phase 7 and `docs/mlx-duplex-debug-log.md` for the
+diagnostic trail.
 
 ## Running on MPS (PyTorch, slower)
 

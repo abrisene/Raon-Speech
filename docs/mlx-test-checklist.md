@@ -190,6 +190,37 @@ print(text)  # Should be close to "Testing the pipeline API."
 - Audio duration varies — shorter text sometimes produces proportionally shorter audio than expected
 - Voice is random each generation without speaker conditioning (expected behavior)
 - Korean output may occur occasionally without explicit language conditioning
+- **Full-duplex SpeechChat requires `quant="8bit"` (uniform), not hybrid.** 4-bit thinker errors compound across the multi-frame loop and produce gibberish audio even though SIL frames render cleanly. Use the `Raon-SpeechChat-9B-mlx-8bit` pre-converted artifact or pass `--quantize 8bit` to the demo. Single-utterance TTS is unaffected and hybrid remains the recommended quant there.
+
+## Duplex / SpeechChat
+
+```bash
+# One-shot conversion to 8-bit pre-quantized artifact (10.32 GB, faster load):
+python -m raon_mlx.utils.convert models/Raon-SpeechChat-9B \
+    --output models/Raon-SpeechChat-9B-mlx-8bit --quant 8bit
+
+# Offline duplex run on a 24kHz mono wav (writes assistant.wav, conversation.wav,
+# transcript.txt, frame_log.txt, summary.json):
+python scripts/run_offline_test.py
+# overrides via env: RAON_USER_WAV, RAON_MODEL_PATH, RAON_HF_PATH, RAON_QUANT,
+# RAON_OUT, RAON_OUT_SUFFIX
+
+# Realtime FastAPI + Gradio demo on http://127.0.0.1:7862 :
+python demo/gradio_mlx_duplex_demo.py \
+    --host 127.0.0.1 --port 7862 \
+    --model-path models/Raon-SpeechChat-9B-mlx-8bit \
+    --hf-model-path models/Raon-SpeechChat-9B \
+    --quantize 8bit
+```
+
+Acceptance criteria:
+- [ ] Offline run on `output/duplex_smoke_after_encoder_fix/user.wav` produces a
+      conversation.wav whose right channel resolves as intelligible English speech.
+- [ ] `frame_log.txt` shows `out_rms ≈ 0.0002` on `[SIL]` frames (silence) and
+      `0.01–0.10` on `[SPEECH]` frames.
+- [ ] Realtime demo streams without Metal command-buffer assertions during a
+      single sustained session (rapid open/close cycles can race the decoder
+      thread; this is a known soft-edge).
 
 ## Audio Files Generated During Development
 

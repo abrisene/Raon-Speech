@@ -58,10 +58,12 @@ answer = pipe.textqa("What did the speaker say?", audio="input.wav")
 | Document | Description |
 |----------|-------------|
 | [macOS Setup](macos-setup.md) | Full setup guide, dependencies, all CLI commands, benchmarks |
-| [MLX Port Roadmap](mlx-port-roadmap.md) | Architecture details, phase completion status, per-frame profiling |
-| [Test Checklist](mlx-test-checklist.md) | Comprehensive test plan with exact commands for every feature |
+| [MLX Port Roadmap](mlx-port-roadmap.md) | Architecture details, phase completion status (incl. Phase 7 / Full-Duplex), per-frame profiling |
+| [Test Checklist](mlx-test-checklist.md) | Comprehensive test plan with exact commands for every feature, incl. Duplex acceptance criteria |
+| [MLX Duplex Debug Log](mlx-duplex-debug-log.md) | Diagnostic trail for the duplex audio bug: per-module parity proofs, sampling and quantization findings |
+| [Duplex MLX Design](duplex-mlx-design.md) | Original design doc for the realtime duplex path |
+| [Duplex MLX Plan](duplex-mlx-plan.md) | Original implementation plan for the realtime duplex path |
 | [Qwen Backbone Upgrade](qwen-backbone-upgrade.md) | Analysis of swapping to Qwen3.5 or larger Qwen models |
-| [Qwen3.5 Architecture](qwen3.5-architecture-analysis.md) | Hybrid SSM-transformer analysis, component comparison |
 | [Qwen3.5 Upgrade Plan](qwen3.5-upgrade-plan.md) | Training plan, hardware requirements, cost estimates, data needs |
 
 ## Architecture
@@ -121,10 +123,35 @@ Input audio → AuT encoder (24L Whisper-like) → Input adaptor (MLP 2048→409
 | `feat/mlx-port` | Production MLX port (19 commits) |
 | `research/qwen-upgrade` | + Qwen3.5 backbone support (configurable) |
 
+## Full-Duplex (Raon-SpeechChat-9B)
+
+End-to-end realtime duplex on MLX, RTF ~1.0 on M-series:
+
+```bash
+# Pre-convert at uniform 8-bit (10.32 GB; 4-bit thinker is too lossy for duplex):
+python -m raon_mlx.utils.convert models/Raon-SpeechChat-9B \
+    --output models/Raon-SpeechChat-9B-mlx-8bit --quant 8bit
+
+# Realtime FastAPI + Gradio demo (open http://127.0.0.1:7862):
+python demo/gradio_mlx_duplex_demo.py \
+    --model-path models/Raon-SpeechChat-9B-mlx-8bit \
+    --hf-model-path models/Raon-SpeechChat-9B \
+    --quantize 8bit
+
+# Offline duplex run on a 24kHz mono wav:
+python scripts/run_offline_test.py
+```
+
+See [Phase 7 in the roadmap](mlx-port-roadmap.md) and
+[`docs/mlx-duplex-debug-log.md`](mlx-duplex-debug-log.md) for the duplex bug
+hunt and per-module parity proofs.
+
 ## Known Limitations
 
 - Pre-converted MLX models have issues with STT (use `--hf-model` flag instead)
-- No full-duplex / Raon-SpeechChat-9B support yet
+- Full-duplex SpeechChat needs `quant="8bit"` — hybrid (4-bit thinker) compounds
+  error across the multi-frame loop and produces gibberish audio. Per-utterance
+  TTS is unaffected.
 - Qwen3.5 backbone requires adaptor retraining for speech tasks
 - Tokenizer prints `OrderedVocab` warnings to stderr (cosmetic, from Rust tokenizer)
 - Other LLMs sharing the GPU will reduce throughput significantly

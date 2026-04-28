@@ -199,9 +199,32 @@ ECAPA-TDNN from SpeechBrain. Small model (~10M params), runs once per utterance.
 - Keep in PyTorch/MPS (single boundary crossing per utterance — negligible overhead)
 - Port to MLX later if desired
 
-### Phase 7: SpeechChat / Full-Duplex (not started)
+### Phase 7: SpeechChat / Full-Duplex ✅
 
-The Raon-SpeechChat-9B model (`RaonDuplexModel`) adds real-time duplex capabilities. This is a separate model with additional architecture on top. Tackle after the base model works.
+`Raon-SpeechChat-9B` runs end-to-end on MLX with intelligible assistant audio at
+real-time RTF (~1.0 on M-series). Duplex loop owned by
+`src/raon_mlx/models/duplex_generate.py`; FastAPI + WebSocket runtime in
+`src/raon_mlx/realtime/`; Gradio demo at `demo/gradio_mlx_duplex_demo.py`.
+
+Key duplex-specific things worth knowing:
+
+1. **8-bit uniform quant is the floor for duplex**, not hybrid. Hybrid (4-bit
+   thinker) compounds error across the multi-frame loop and produces gibberish
+   audio even though SIL frames render cleanly and per-forward parity vs PT is
+   exact (cos 0.9999968). Use `quant="8bit"` for SpeechChat. Hybrid remains
+   fine for TTS-only paths.
+2. **SIL detection is phase-based**, not `emitted_audio` (which is always True
+   because every chunk contains AUDIO_OUTPUT_PLACEHOLDER). During SIL, feed
+   silence_codes both to Mimi `decode_step` and as `prev_audio_feedback` so
+   the talker cache stays on a silence trajectory.
+3. **Code predictor codebooks 2–16 are greedy**, matching PT's `predict_codes`.
+   Only codebook 1 samples (with the same temperature as text).
+4. RAS (repetition-aware sampling) is plumbed in `generate_audio_codes` via
+   `ras_enabled=False` default; off matches PT's typical behavior.
+
+See `docs/mlx-duplex-debug-log.md` for the full diagnostic trail and the
+single-forward parity proofs (thinker / talker / code predictor / output
+adaptor all match PT cos 0.99997+).
 
 ## Measured Performance (M5 Max, 128GB)
 
@@ -225,7 +248,8 @@ The Raon-SpeechChat-9B model (`RaonDuplexModel`) adds real-time duplex capabilit
 ### Comparison with original projections
 
 - Projected: RTF 0.3-0.8 → **Achieved: RTF 0.46** (within range, toward the fast end)
-- The hybrid quantization (4-bit backbone, 8-bit audio components) is both faster and higher quality than uniform 4-bit
+- The hybrid quantization (4-bit backbone, 8-bit audio components) is both faster and higher quality than uniform 4-bit **for TTS-only**.
+  For full-duplex SpeechChat use **uniform 8-bit** (`quant="8bit"`); 4-bit thinker errors compound across many frames and produce gibberish audio. See Phase 7.
 
 ## File Structure
 
