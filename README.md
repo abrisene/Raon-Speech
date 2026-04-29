@@ -78,7 +78,7 @@ Apple Silicon. All four tasks run on-device on M-series Macs:
 | TTS (hybrid quant) | **2.6× real-time** (RTF 0.38) | M5 Max, 9B model |
 | STT | **6.5× real-time** | 1.2 s decode for 7.8 s audio |
 | VoiceChat (STT → response → TTS) | **Faster than real-time** | chained pipeline |
-| **SpeechChat (full-duplex realtime)** | **RTF 0.70** | M-series, 8-bit, ~24 ms headroom under the 80 ms frame budget |
+| **SpeechChat (full-duplex realtime)** | **RTF 0.66** | M-series, 8-bit, ~27 ms headroom under the 80 ms frame budget |
 
 Quick start:
 
@@ -111,7 +111,7 @@ implementation under `src/raon/` is untouched. See
 [`docs/README.md`](docs/README.md) for the doc index,
 [`docs/mlx-port-roadmap.md`](docs/mlx-port-roadmap.md) for the architecture
 notes and per-frame performance profile (including the 2026-04-28 perf
-pass that took duplex from RTF ~0.88 to ~0.70), and
+pass that took duplex from RTF ~0.88 to ~0.66), and
 [`docs/mlx-test-checklist.md`](docs/mlx-test-checklist.md) for the
 acceptance tests.
 

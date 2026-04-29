@@ -125,8 +125,8 @@ Input audio → AuT encoder (24L Whisper-like) → Input adaptor (MLP 2048→409
 
 ## Full-Duplex (Raon-SpeechChat-9B)
 
-End-to-end realtime duplex on MLX, **RTF ~0.70 on M-series** (8-bit, 80 ms
-frames, ~24 ms headroom — 2026-04-28 perf pass).
+End-to-end realtime duplex on MLX, **RTF ~0.66 on M-series** (8-bit, 80 ms
+frames, ~27 ms headroom — 2026-04-28 perf pass).
 
 ```bash
 # Pre-convert at uniform 8-bit (10.32 GB; 4-bit thinker is too lossy for duplex):

@@ -316,11 +316,11 @@ The SpeechChat model adds simultaneous listen/speak capability:
 
 ### Headline numbers (after 2026-04-28 perf pass)
 
-| Metric                  | Baseline (pre-pass) | After op-level pass | After encoder bf16 |
-|-------------------------|---------------------|---------------------|--------------------|
-| Mean RTF (8 det. runs)  | ~0.88               | 0.78                | **0.70**           |
-| Avg frame time          | ~70 ms              | 63.7 ms             | **55.9 ms**        |
-| Headroom under 80 ms    | ~10 ms              | ~16 ms (~20%)       | **~24 ms (~30%)**  |
+| Metric                  | Baseline | Op-level pass | Encoder bf16 | Encoder 8-bit |
+|-------------------------|----------|---------------|--------------|---------------|
+| Mean RTF (8 det. runs)  | ~0.88    | 0.78          | 0.70         | **0.66**      |
+| Avg frame time          | ~70 ms   | 63.7 ms       | 55.9 ms      | **52.8 ms**   |
+| Headroom under 80 ms    | ~10 ms   | ~16 ms        | ~24 ms       | **~27 ms (~34%)** |
 
 Bench harness: `scripts/bench_duplex.py` — fixed seed, 3-frame warmup,
 deterministic across runs (so the RTF is comparable; offline test RTF varies
@@ -380,6 +380,7 @@ the code predictor (which is only ~3.6 ms when called).
 | Code-predictor KV cache reuse across frames | `models/generate.py` (prior pass) | ~13% on 28 s offline run |
 | `KVCache` accepts `list[int]` for `cache_position` | `modules/kv_cache.py`, `models/qwen3.py`, `models/raon.py` | Plumbing only — passive option after benchmarking didn't show net win |
 | **Streaming Voxtral encoder defaults to bfloat16** (was fp32) | `utils/streaming_encoder.py` | **~7 ms/frame, 10% RTF reduction.** Encoder runs every frame and was the largest unquantized op left. |
+| **Streaming Voxtral encoder Linear layers 8-bit quant** | `utils/streaming_encoder.py` | **~3 ms/frame, 4-5% additional RTF reduction.** `nn.quantize` skips Conv1d so the conv stem stays bf16; only attention QKV/O + feed-forward Linears are quantized. |
 
 ### `mx.compile` exploration (no win at the layer-or-larger scale)
 
