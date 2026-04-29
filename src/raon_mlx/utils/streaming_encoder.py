@@ -78,7 +78,11 @@ class StreamingAudioEncoder:
         encode_frame(pcm: mx.array) -> mx.array of shape [1, T_adapter, 4096]
     """
 
-    def __init__(self, model_path: str, dtype: mx.Dtype = mx.float32) -> None:
+    def __init__(self, model_path: str, dtype: mx.Dtype = mx.bfloat16) -> None:
+        # bfloat16 default: this encoder runs every frame and was 14 ms in
+        # fp32 — about 22% of the duplex frame budget. The conv stem and
+        # transformer layers are bfloat16-safe (matches the rest of the
+        # model). Mel filters stay fp32 internally for numeric stability.
         self._model_path = model_path
         self._dtype = dtype
 

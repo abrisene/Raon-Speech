@@ -316,15 +316,22 @@ The SpeechChat model adds simultaneous listen/speak capability:
 
 ### Headline numbers (after 2026-04-28 perf pass)
 
-| Metric                  | Baseline (pre-pass) | Current  |
-|-------------------------|---------------------|----------|
-| Mean RTF (8 det. runs)  | ~0.88               | **0.78** |
-| Avg frame time          | ~70 ms              | **63.7 ms** |
-| Headroom under 80 ms    | ~10 ms              | **~16 ms (~20%)** |
+| Metric                  | Baseline (pre-pass) | After op-level pass | After encoder bf16 |
+|-------------------------|---------------------|---------------------|--------------------|
+| Mean RTF (8 det. runs)  | ~0.88               | 0.78                | **0.70**           |
+| Avg frame time          | ~70 ms              | 63.7 ms             | **55.9 ms**        |
+| Headroom under 80 ms    | ~10 ms              | ~16 ms (~20%)       | **~24 ms (~30%)**  |
 
 Bench harness: `scripts/bench_duplex.py` — fixed seed, 3-frame warmup,
 deterministic across runs (so the RTF is comparable; offline test RTF varies
 with the sampled response length).
+
+The fine-grained profiler `scripts/profile_duplex_fine.py` materializes
+deferred MLX work at every section boundary (since `mx.synchronize` alone
+doesn't trigger lazy evaluation). It surfaced the streaming Voxtral encoder
+running at ~14 ms/frame in fp32 — that's the second-largest cost after the
+thinker. Switching the encoder default dtype to bfloat16 (matching the rest
+of the model) halves that to ~7 ms with no audio quality regression.
 
 ### Per-section profile (`scripts/profile_duplex.py`)
 
@@ -372,6 +379,7 @@ the code predictor (which is only ~3.6 ms when called).
 | Logit-mask cache (4 entries cover all states) | `utils/state_machine.py` | Skips the 600 KB numpy→mlx copy after first frame |
 | Code-predictor KV cache reuse across frames | `models/generate.py` (prior pass) | ~13% on 28 s offline run |
 | `KVCache` accepts `list[int]` for `cache_position` | `modules/kv_cache.py`, `models/qwen3.py`, `models/raon.py` | Plumbing only — passive option after benchmarking didn't show net win |
+| **Streaming Voxtral encoder defaults to bfloat16** (was fp32) | `utils/streaming_encoder.py` | **~7 ms/frame, 10% RTF reduction.** Encoder runs every frame and was the largest unquantized op left. |
 
 ### `mx.compile` exploration (no win at the layer-or-larger scale)
 
