@@ -426,25 +426,27 @@ callsite. We've left the existing path in place.
 
 ## Known Issues / Soft Edges
 
-- **Metal command-buffer race during rapid session restart** in the realtime
-  Gradio demo. Symptom: `failed assertion 'A command encoder is already
-  encoding to this command buffer'` followed by `SIGSEGV` (exit 139) when a
-  session is finished and a new one is started in quick succession. The
-  concurrent decoder + Metal command stream from the prior session hasn't
-  fully drained when the new session's first decoder call lands.
-
-  Workaround: wait ~1 s between Stop and Start, or refresh the page. Single
-  long-running sessions are unaffected. Suspected fix is a hard
-  `mx.synchronize()` + decoder-state reset on session teardown before
-  releasing the runtime to the next session, but the actual fix needs
-  reproduction with a debug build of MLX.
-
 - **External speakers + duplex**: the duplex model is full-duplex by design
   and listens during its own speech. Browser-level AEC (we request
   `echoCancellation: true`) handles built-in mic + built-in speakers
   reasonably on macOS, but external speakers can produce a feedback loop.
   Use headphones, or add server-side mic gating during the assistant
   SPEECH phase if needed (loses barge-in).
+
+## Recently Resolved
+
+- ~~Metal command-buffer race during rapid session restart~~ — fixed
+  2026-04-28. Symptom was `failed assertion 'A command encoder is already
+  encoding to this command buffer'` + `SIGSEGV` (exit 139) when finishing
+  a session and starting a new one in quick succession. Root cause: the
+  next session's `init_duplex_state` was racing the previous session's
+  last `mimi.decode_step` on shared `model.mimi` streaming state.
+  Fix: a per-session step lock guards `handle_audio_frame`, and a new
+  `MLXRealtimeDuplexSession.drain()` (called from
+  `RealtimeRuntimeManager.finish_session` while still holding the manager
+  lock) does `mx.synchronize()` + `mimi.reset_all()` + `mx.synchronize()`
+  before the active-session slot is released — so the next session's
+  init can never observe in-flight commands from the previous one.
 
 ## Open Questions
 

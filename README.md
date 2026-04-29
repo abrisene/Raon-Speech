@@ -119,10 +119,6 @@ For full-duplex use, prefer **uniform 8-bit** (`--quantize 8bit`); 4-bit
 thinker errors compound across the multi-frame loop and produce gibberish
 audio. Single-utterance TTS works fine with the hybrid quant default.
 
-Known soft-edge: rapid Stop→Start session cycles in the realtime demo can
-hit a Metal command-buffer race (`SIGSEGV` exit 139). Wait ~1 s between
-sessions or refresh the page.
-
 ## Requirements
 
 - Python `>=3.11`

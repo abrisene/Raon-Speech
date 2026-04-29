@@ -152,9 +152,10 @@ section for the per-section breakdown and applied optimizations, and
 [`docs/mlx-duplex-debug-log.md`](mlx-duplex-debug-log.md) for the duplex bug
 hunt and per-module parity proofs.
 
-Known soft-edge: the realtime demo can hit a Metal command-buffer race on
-rapid Stop→Start session cycles (`SIGSEGV` exit 139). Wait ~1 s between
-sessions or refresh the page; single sustained sessions are unaffected.
+Rapid Stop→Start session cycles in the realtime demo are now safe (the
+2026-04-28 drain fix in `RealtimeRuntimeManager.finish_session` +
+`MLXRealtimeDuplexSession.drain()` synchronizes the GPU and resets
+`model.mimi` streaming state before the next session's init can run).
 
 ## Known Limitations
 

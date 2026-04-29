@@ -224,10 +224,15 @@ Acceptance criteria:
 - [ ] `scripts/bench_duplex.py --runs 8` reports mean RTF < 0.85 (current
       baseline ~0.78 on M-series, 8-bit, after the 2026-04-28 perf pass).
 - [ ] Realtime demo streams without Metal command-buffer assertions during a
-      single sustained session. Rapid Stop→Start cycles can hit a Metal race
-      that produces `failed assertion 'A command encoder is already encoding
-      to this command buffer'` and `SIGSEGV` (exit 139); this is a known
-      soft-edge — wait ~1 s between Stop and Start, or refresh the page.
+      single sustained session.
+- [ ] Rapid Stop → Start session cycles in the realtime demo no longer crash.
+      The 2026-04-28 drain fix (per-session step lock +
+      `MLXRealtimeDuplexSession.drain()` called from
+      `RealtimeRuntimeManager.finish_session` under the manager lock) ensures
+      the next session's `init_duplex_state` cannot race the previous
+      session's last `mimi.decode_step`. If you still see `failed assertion
+      'A command encoder is already encoding to this command buffer'` /
+      `SIGSEGV` (exit 139), please reopen the issue with a repro.
 
 ## Audio Files Generated During Development
 
