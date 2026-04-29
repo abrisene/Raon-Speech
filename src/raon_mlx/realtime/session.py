@@ -194,6 +194,10 @@ class MLXRealtimeDuplexSession:
         self._closed = False
         self._close_reason: str | None = None
         self._result_payload: dict[str, Any] | None = None
+        # Serializes handle_audio_frame against drain/finish so the next
+        # session can't reset model.mimi while a duplex_step is mid-flight.
+        self._step_lock = threading.Lock()
+        self._drained = False
 
     def _load_speaker_embeds(self, audio_path: str):
         import mlx.core as mx
@@ -208,9 +212,15 @@ class MLXRealtimeDuplexSession:
         return [Frame.ready()]
 
     def handle_audio_frame(self, pcm: np.ndarray) -> list[Frame]:
-        if self._closed:
-            return [Frame.close(self._close_reason or "finished")]
+        # Serialize against drain() / finish() — protects shared model.mimi
+        # state from being reset while a duplex_step is mid-flight (which
+        # otherwise produces a Metal command-encoder race on session restart).
+        with self._step_lock:
+            if self._closed:
+                return [Frame.close(self._close_reason or "finished")]
+            return self._handle_audio_frame_locked(pcm)
 
+    def _handle_audio_frame_locked(self, pcm: np.ndarray) -> list[Frame]:
         import mlx.core as mx
         from ..models.duplex_generate import duplex_step
 
@@ -317,6 +327,39 @@ class MLXRealtimeDuplexSession:
                     frames.append(Frame.text(text_delta))
 
         return frames
+
+    def drain(self) -> None:
+        """Force-drain in-flight GPU work and reset shared model streaming state.
+
+        Called from the runtime manager's finish_session under the manager
+        lock so the next session's init_duplex_state can reset model.mimi
+        without racing this session's last mimi.decode_step on the Metal
+        command buffer (the rapid-restart SIGSEGV soft-edge).
+
+        Idempotent. Acquires the per-session step lock so it cannot run
+        concurrently with handle_audio_frame.
+        """
+        with self._step_lock:
+            if self._drained:
+                return
+            self._drained = True
+            try:
+                import mlx.core as mx
+                # Drain any commands queued by the last duplex_step.
+                mx.synchronize()
+                # Reset the shared mimi streaming state so the next session
+                # starts from clean encoder/decoder buffers. The next session's
+                # init_duplex_state will call reset_all again, but doing it
+                # here while holding the manager lock guarantees no in-flight
+                # decode_step is mutating self.decoder.state when the next
+                # session's reset hits.
+                if self._model is not None:
+                    self._model.mimi.reset_all()
+                    mx.synchronize()
+            except Exception:
+                logger.exception(
+                    "drain failed (non-fatal) session=%s", self.session_id,
+                )
 
     def request_close(self, reason: str) -> list[Frame]:
         self.finish(reason)

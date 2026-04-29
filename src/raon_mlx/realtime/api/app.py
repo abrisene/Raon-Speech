@@ -139,6 +139,15 @@ class RealtimeRuntimeManager:
             if self._active_session_id != session_id or self._active_session is None:
                 raise KeyError(session_id)
             session = self._active_session
+            # Drain GPU work + reset shared model streaming state BEFORE
+            # releasing the active slot, so the next session's
+            # init_duplex_state can't race this session's last mimi
+            # decode_step on the Metal command buffer (the rapid-restart
+            # SIGSEGV soft-edge).
+            drain_fn = getattr(session, "drain", None)
+            if callable(drain_fn):
+                with contextlib.suppress(Exception):
+                    drain_fn()
             self._active_session = None
             self._active_session_id = None
             self._active_session_connected = False
