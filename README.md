@@ -68,6 +68,61 @@ On single-GPU streaming TTS setups, the model runs faster than real time on both
 - `TTFT`: Time to First Token.
 - `TBT`: Time Between Tokens.
 
+## Apple Silicon (MLX) Port
+
+This fork adds a pure-MLX port of Raon-Speech / Raon-SpeechChat targeting
+Apple Silicon. All four tasks run on-device on M-series Macs:
+
+| Task | Speed | Notes |
+|---|---|---|
+| TTS (hybrid quant) | **2.6× real-time** (RTF 0.38) | M5 Max, 9B model |
+| STT | **6.5× real-time** | 1.2 s decode for 7.8 s audio |
+| VoiceChat (STT → response → TTS) | **Faster than real-time** | chained pipeline |
+| **SpeechChat (full-duplex realtime)** | **RTF 0.78** | M-series, 8-bit, ~16 ms headroom under the 80 ms frame budget |
+
+Quick start:
+
+```bash
+# Install with the mlx extra (CPU + Metal; pulls fastapi/gradio/uvicorn for the demo)
+uv sync --extra mlx --extra dev
+
+# Pre-convert SpeechChat-9B to uniform 8-bit (10.32 GB, fast load):
+python -m raon_mlx.utils.convert models/Raon-SpeechChat-9B \
+    --output models/Raon-SpeechChat-9B-mlx-8bit --quant 8bit
+
+# Realtime full-duplex Gradio demo on http://127.0.0.1:7862 :
+python demo/gradio_mlx_duplex_demo.py \
+    --model-path models/Raon-SpeechChat-9B-mlx-8bit \
+    --hf-model-path models/Raon-SpeechChat-9B \
+    --quantize 8bit
+
+# Offline duplex run on a 24 kHz mono wav:
+python scripts/run_offline_test.py
+
+# Deterministic per-frame bench (8 runs, fixed seed):
+PYTHONPATH=src python scripts/bench_duplex.py --runs 8
+
+# TTS (CLI):
+python -m raon_mlx.tts "Hello there." -o out.wav --model models/Raon-Speech-9B
+```
+
+The MLX port lives entirely under `src/raon_mlx/`; the upstream PyTorch
+implementation under `src/raon/` is untouched. See
+[`docs/README.md`](docs/README.md) for the doc index,
+[`docs/mlx-port-roadmap.md`](docs/mlx-port-roadmap.md) for the architecture
+notes and per-frame performance profile (including the 2026-04-28 perf
+pass that took duplex from RTF ~0.88 to ~0.78), and
+[`docs/mlx-test-checklist.md`](docs/mlx-test-checklist.md) for the
+acceptance tests.
+
+For full-duplex use, prefer **uniform 8-bit** (`--quantize 8bit`); 4-bit
+thinker errors compound across the multi-frame loop and produce gibberish
+audio. Single-utterance TTS works fine with the hybrid quant default.
+
+Known soft-edge: rapid Stop→Start session cycles in the realtime demo can
+hit a Metal command-buffer race (`SIGSEGV` exit 139). Wait ~1 s between
+sessions or refresh the page.
+
 ## Requirements
 
 - Python `>=3.11`
